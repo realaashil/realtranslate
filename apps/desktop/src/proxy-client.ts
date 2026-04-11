@@ -95,11 +95,17 @@ interface TranslationRequestInput {
   speaker: Speaker;
 }
 
+type CredentialsProvider = () => {
+  token: string | null;
+  deviceId: string;
+};
+
 interface ProxyClientOptions {
   url: string;
   authToken?: string;
   deviceId?: string;
   heartbeatMs?: number;
+  credentialsProvider?: CredentialsProvider;
   onConnectionStateChange?: (state: ProxyConnectionState) => void;
   onServerMessage?: (message: ServerMessage) => void;
 }
@@ -140,9 +146,10 @@ const parseServerMessage = (raw: string): ServerMessage | null => {
 
 export class TranslationProxyClient {
   private readonly url: string;
-  private readonly authToken: string;
-  private readonly deviceId: string;
+  private authToken: string;
+  private deviceId: string;
   private readonly heartbeatMs: number;
+  private readonly credentialsProvider?: CredentialsProvider;
   private readonly onConnectionStateChange?: (
     state: ProxyConnectionState,
   ) => void;
@@ -164,9 +171,10 @@ export class TranslationProxyClient {
 
   constructor(options: ProxyClientOptions) {
     this.url = options.url;
-    this.authToken = options.authToken ?? process.env.PROXY_AUTH_TOKEN ?? "dev-token";
+    this.authToken = options.authToken ?? process.env.PROXY_AUTH_TOKEN ?? "";
     this.deviceId = options.deviceId ?? process.env.PROXY_DEVICE_ID ?? "desktop-dev-device";
     this.heartbeatMs = options.heartbeatMs ?? DEFAULT_HEARTBEAT_MS;
+    this.credentialsProvider = options.credentialsProvider;
     this.onConnectionStateChange = options.onConnectionStateChange;
     this.onServerMessage = options.onServerMessage;
   }
@@ -253,6 +261,31 @@ export class TranslationProxyClient {
         sentAt: Date.now(),
       });
     }, this.heartbeatMs);
+  }
+
+  private currentCredentials(): { token: string | null; deviceId: string } {
+    if (this.credentialsProvider) {
+      return this.credentialsProvider();
+    }
+
+    return {
+      token: this.authToken || null,
+      deviceId: this.deviceId,
+    };
+  }
+
+  setCredentials(credentials: {
+    token: string | null;
+    deviceId?: string;
+  }): void {
+    this.authToken = credentials.token ?? "";
+    if (credentials.deviceId) {
+      this.deviceId = credentials.deviceId;
+    }
+
+    if (this.socket && this.socket.readyState === WebSocket.OPEN) {
+      this.socket.close();
+    }
   }
 
   private send(message: ClientMessage): void {
@@ -362,11 +395,17 @@ export class TranslationProxyClient {
     socket.on("open", () => {
       this.authenticated = false;
 
+      const credentials = this.currentCredentials();
+      if (!credentials.token) {
+        this.failAuth("Authentication required. Please sign in.");
+        return;
+      }
+
       try {
         this.send({
           type: "auth",
-          token: this.authToken,
-          deviceId: this.deviceId,
+          token: credentials.token,
+          deviceId: credentials.deviceId,
         });
       } catch (error) {
         this.failAuth(toError(error).message);

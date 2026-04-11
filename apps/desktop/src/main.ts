@@ -6,6 +6,7 @@ import {
   globalShortcut,
   ipcMain,
 } from "electron";
+import { createClient, type Session, type User } from "@supabase/supabase-js";
 import { execSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
@@ -24,6 +25,7 @@ import {
 type MeetingLifecycle = "idle" | "prompt" | "active" | "stopping";
 
 type DetectionDecision = "auto-start" | "prompt" | "idle";
+type AuthStatus = "signed_out" | "signing_in" | "signed_in";
 
 interface OverlayBounds {
   x: number;
@@ -57,6 +59,13 @@ interface RateWarning {
   limit: number;
 }
 
+interface AuthSnapshot {
+  status: AuthStatus;
+  email: string | null;
+  userId: string | null;
+  error: string | null;
+}
+
 interface PipelineSnapshot {
   isRunning: boolean;
   proxyConnection: ProxyConnectionState;
@@ -70,6 +79,12 @@ interface PipelineSnapshot {
   sessionResetAtUtc: string | null;
   lastProxyNotice: string | null;
   activeLanguagePair: string;
+  auth: AuthSnapshot;
+}
+
+interface AuthSignInInput {
+  email: string;
+  password: string;
 }
 
 const MEETING_PROCESS_HINTS = [
@@ -115,6 +130,12 @@ let dailyRemainingMs: number | null = null;
 let sessionResetAtUtc: string | null = null;
 let lastProxyNotice: string | null = null;
 
+let authStatus: AuthStatus = "signed_out";
+let authUserEmail: string | null = null;
+let authUserId: string | null = null;
+let authError: string | null = null;
+let authAccessToken: string | null = null;
+
 let meetingSnapshot: MeetingSnapshot = {
   lifecycle: "idle",
   evaluation: {
@@ -133,6 +154,38 @@ let meetingSnapshot: MeetingSnapshot = {
 if (started) {
   app.quit();
 }
+
+const supabaseUrl = process.env.SUPABASE_URL;
+const supabaseAnonKey = process.env.SUPABASE_ANON_KEY;
+
+if (!supabaseUrl || !supabaseAnonKey) {
+  throw new Error(
+    "Missing SUPABASE_URL or SUPABASE_ANON_KEY for desktop auth",
+  );
+}
+
+const supabase = createClient(supabaseUrl, supabaseAnonKey, {
+  auth: {
+    autoRefreshToken: true,
+    persistSession: true,
+  },
+});
+
+const applySession = (session: Session | null, userOverride?: User | null): void => {
+  authAccessToken = session?.access_token ?? null;
+
+  const user = userOverride ?? session?.user ?? null;
+  authUserEmail = user?.email ?? null;
+  authUserId = user?.id ?? null;
+
+  authStatus = session ? "signed_in" : "signed_out";
+
+  if (!session && isPipelineRunning) {
+    stopPipelines();
+  }
+
+  emitSnapshot();
+};
 
 const getRendererUrl = (): string => {
   if (
@@ -178,6 +231,13 @@ const compareUtterances = (
 
 const activeLanguagePair = (): string => `${YOU_SOURCE_LANG} → ${YOU_TARGET_LANG}`;
 
+const authSnapshot = (): AuthSnapshot => ({
+  status: authStatus,
+  email: authUserEmail,
+  userId: authUserId,
+  error: authError,
+});
+
 const getSnapshot = (): PipelineSnapshot => {
   const ordered = [...utterances.values()].sort(compareUtterances);
   return {
@@ -193,6 +253,7 @@ const getSnapshot = (): PipelineSnapshot => {
     sessionResetAtUtc,
     lastProxyNotice,
     activeLanguagePair: activeLanguagePair(),
+    auth: authSnapshot(),
   };
 };
 
@@ -230,6 +291,12 @@ const handleProxyServerMessage = (message: ServerMessage): void => {
     case "error":
       if (!message.utteranceId) {
         lastProxyNotice = message.message;
+
+        if (message.code === "unauthorized" || message.code === "session_required") {
+          authStatus = "signed_out";
+          authError = message.message;
+          authAccessToken = null;
+        }
       }
       break;
     case "translation_chunk":
@@ -242,6 +309,10 @@ const handleProxyServerMessage = (message: ServerMessage): void => {
 
 const proxyClient = new TranslationProxyClient({
   url: process.env.PROXY_WS_URL ?? "ws://127.0.0.1:8787/ws",
+  credentialsProvider: () => ({
+    token: authAccessToken,
+    deviceId: process.env.PROXY_DEVICE_ID ?? "desktop-dev-device",
+  }),
   onConnectionStateChange: (state) => {
     proxyConnectionState = state;
 
@@ -396,6 +467,12 @@ const clearUtterances = (): PipelineSnapshot => {
 };
 
 const startPipelines = (): PipelineSnapshot => {
+  if (authStatus !== "signed_in" || !authAccessToken) {
+    lastProxyNotice = "Sign in with email before starting translation";
+    emitSnapshot();
+    return getSnapshot();
+  }
+
   if (isPipelineRunning) {
     return getSnapshot();
   }
@@ -484,6 +561,7 @@ const createOverlayWindow = (): BrowserWindow => {
       preload: preloadPath,
       contextIsolation: true,
       nodeIntegration: false,
+      sandbox: false,
     },
   });
 
@@ -499,6 +577,11 @@ const createOverlayWindow = (): BrowserWindow => {
   }
 
   window.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
+
+  if (MAIN_WINDOW_VITE_DEV_SERVER_URL) {
+    window.webContents.openDevTools({ mode: "detach" });
+  }
+
   return window;
 };
 
@@ -564,6 +647,54 @@ const registerShortcuts = (): void => {
   });
 };
 
+const signInWithPassword = async (
+  input: AuthSignInInput,
+): Promise<AuthSnapshot> => {
+  authStatus = "signing_in";
+  authError = null;
+  emitSnapshot();
+
+  const { data, error } = await supabase.auth.signInWithPassword({
+    email: input.email,
+    password: input.password,
+  });
+
+  if (error) {
+    authStatus = "signed_out";
+    authError = error.message;
+    authAccessToken = null;
+    emitSnapshot();
+    throw new Error(error.message);
+  }
+
+  applySession(data.session ?? null, data.user ?? null);
+  authError = null;
+  proxyClient.setCredentials({ token: authAccessToken });
+
+  return authSnapshot();
+};
+
+const signOut = async (): Promise<AuthSnapshot> => {
+  const { error } = await supabase.auth.signOut();
+  if (error) {
+    authError = error.message;
+    emitSnapshot();
+    throw new Error(error.message);
+  }
+
+  applySession(null, null);
+  authError = null;
+  proxyClient.setCredentials({ token: null });
+
+  return authSnapshot();
+};
+
+const getAuthSnapshot = async (): Promise<AuthSnapshot> => {
+  const { data } = await supabase.auth.getSession();
+  applySession(data.session ?? null, data.session?.user ?? null);
+  return authSnapshot();
+};
+
 const registerIpcHandlers = (): void => {
   ipcMain.handle("overlay:toggle", () => toggleOverlay());
 
@@ -587,6 +718,12 @@ const registerIpcHandlers = (): void => {
   ipcMain.handle("pipelines:stop", () => stopPipelines());
   ipcMain.handle("pipelines:clear", () => clearUtterances());
   ipcMain.handle("pipelines:get", () => getSnapshot());
+
+  ipcMain.handle("auth:sign-in", (_event, input: AuthSignInInput) =>
+    signInWithPassword(input),
+  );
+  ipcMain.handle("auth:sign-out", () => signOut());
+  ipcMain.handle("auth:get", () => getAuthSnapshot());
 };
 
 const processList = (): string[] => {
@@ -640,11 +777,23 @@ const meetingOrchestrator = new MeetingOrchestrator({
   },
 });
 
-app.on("ready", () => {
+app.on("ready", async () => {
   overlayWindow = createOverlayWindow();
   registerIpcHandlers();
   createTray();
   registerShortcuts();
+
+  const { data } = await supabase.auth.getSession();
+  applySession(data.session ?? null, data.session?.user ?? null);
+
+  supabase.auth.onAuthStateChange((_event, session) => {
+    applySession(session ?? null, session?.user ?? null);
+
+    proxyClient.setCredentials({
+      token: session?.access_token ?? null,
+    });
+  });
+
   meetingOrchestrator.start();
   emitSnapshot();
 });

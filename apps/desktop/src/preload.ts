@@ -24,6 +24,7 @@ type ProxyConnectionState =
 
 type MeetingLifecycle = "idle" | "prompt" | "active" | "stopping";
 type DetectionDecision = "auto-start" | "prompt" | "idle";
+type AuthStatus = "signed_out" | "signing_in" | "signed_in";
 
 interface PipelineUtterance {
   id: string;
@@ -42,6 +43,13 @@ interface RateWarning {
   limit: number;
 }
 
+interface AuthSnapshot {
+  status: AuthStatus;
+  email: string | null;
+  userId: string | null;
+  error: string | null;
+}
+
 interface PipelineSnapshot {
   isRunning: boolean;
   proxyConnection: ProxyConnectionState;
@@ -55,6 +63,12 @@ interface PipelineSnapshot {
   sessionResetAtUtc: string | null;
   lastProxyNotice: string | null;
   activeLanguagePair: string;
+  auth: AuthSnapshot;
+}
+
+interface AuthSignInInput {
+  email: string;
+  password: string;
 }
 
 interface OverlayWindowApi {
@@ -69,6 +83,12 @@ interface PipelineApi {
   clear: () => Promise<PipelineSnapshot>;
   get: () => Promise<PipelineSnapshot>;
   onUpdate: (listener: (snapshot: PipelineSnapshot) => void) => () => void;
+}
+
+interface AuthApi {
+  signIn: (input: AuthSignInInput) => Promise<AuthSnapshot>;
+  signOut: () => Promise<AuthSnapshot>;
+  get: () => Promise<AuthSnapshot>;
 }
 
 const overlayApi: OverlayWindowApi = {
@@ -96,12 +116,20 @@ const pipelineApi: PipelineApi = {
   },
 };
 
+const authApi: AuthApi = {
+  signIn: (input: AuthSignInInput) => ipcRenderer.invoke("auth:sign-in", input),
+  signOut: () => ipcRenderer.invoke("auth:sign-out"),
+  get: () => ipcRenderer.invoke("auth:get"),
+};
+
 contextBridge.exposeInMainWorld("overlay", overlayApi);
 contextBridge.exposeInMainWorld("pipelines", pipelineApi);
+contextBridge.exposeInMainWorld("auth", authApi);
 
 declare global {
   interface Window {
     overlay: OverlayWindowApi;
     pipelines: PipelineApi;
+    auth: AuthApi;
   }
 }
