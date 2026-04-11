@@ -37,6 +37,11 @@ interface PipelineUtterance {
   confidence: number;
 }
 
+interface RateWarning {
+  remaining: number;
+  limit: number;
+}
+
 interface PipelineSnapshot {
   isRunning: boolean;
   proxyConnection: ProxyConnectionState;
@@ -45,6 +50,11 @@ interface PipelineSnapshot {
   meetingDecision: DetectionDecision;
   autoStopSecondsRemaining: number | null;
   utterances: PipelineUtterance[];
+  rateWarning: RateWarning | null;
+  dailyRemainingMs: number | null;
+  sessionResetAtUtc: string | null;
+  lastProxyNotice: string | null;
+  activeLanguagePair: string;
 }
 
 interface OverlayWindowApi {
@@ -56,6 +66,7 @@ interface OverlayWindowApi {
 interface PipelineApi {
   start: () => Promise<PipelineSnapshot>;
   stop: () => Promise<PipelineSnapshot>;
+  clear: () => Promise<PipelineSnapshot>;
   get: () => Promise<PipelineSnapshot>;
   onUpdate: (listener: (snapshot: PipelineSnapshot) => void) => () => void;
 }
@@ -70,6 +81,7 @@ const overlayApi: OverlayWindowApi = {
 const pipelineApi: PipelineApi = {
   start: () => ipcRenderer.invoke("pipelines:start"),
   stop: () => ipcRenderer.invoke("pipelines:stop"),
+  clear: () => ipcRenderer.invoke("pipelines:clear"),
   get: () => ipcRenderer.invoke("pipelines:get"),
   onUpdate: (listener) => {
     const handler = (_event: unknown, snapshot: PipelineSnapshot): void => {

@@ -44,6 +44,7 @@ export type ServerMessage =
   | {
       type: "rate_limited";
       retryAfterMs: number;
+      utteranceId?: string;
     }
   | {
       type: "session_warning";
@@ -59,7 +60,10 @@ export type ServerMessage =
         | "unauthorized"
         | "device_mismatch"
         | "invalid_payload"
-        | "translation_failed";
+        | "translation_failed"
+        | "session_required"
+        | "invalid_language"
+        | "text_too_long";
       message: string;
       utteranceId?: string;
     }

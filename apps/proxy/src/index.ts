@@ -1,6 +1,11 @@
 import { Hono } from 'hono';
 import { jwtVerify, type JWTPayload } from 'jose';
-import { RATE_LIMITS, SESSION_LIMITS, type ClientMessage, type ServerMessage } from '@realtime/shared';
+import {
+	RATE_LIMITS,
+	SESSION_LIMITS,
+	type ClientMessage,
+	type ServerMessage,
+} from '@realtime/shared';
 import { z } from 'zod';
 
 interface Env {
@@ -13,8 +18,34 @@ interface SessionState {
 	activeSince: number | null;
 	activeMsToday: number;
 	requestsInCurrentMinute: number;
+	concurrentRequests: number;
 	currentMinuteKey: string;
 }
+
+interface AuthSession {
+	userId: string;
+	deviceId: string;
+	sessionId: string;
+}
+
+interface DurableEnvelope {
+	messages: ServerMessage[];
+}
+
+const SUPPORTED_LANGUAGES = new Set([
+	'en-US',
+	'hi-IN',
+	'es-ES',
+	'fr-FR',
+	'de-DE',
+	'it-IT',
+	'pt-BR',
+	'ru-RU',
+	'ja-JP',
+	'ko-KR',
+	'zh-CN',
+	'ar-SA',
+]);
 
 const authSchema = z.object({
 	type: z.literal('auth'),
@@ -41,7 +72,12 @@ const disconnectSchema = z.object({
 	reason: z.enum(['meeting_ended', 'user_stopped', 'shutdown']),
 });
 
-const clientMessageSchema = z.discriminatedUnion('type', [authSchema, translateSchema, pingSchema, disconnectSchema]);
+const clientMessageSchema = z.discriminatedUnion('type', [
+	authSchema,
+	translateSchema,
+	pingSchema,
+	disconnectSchema,
+]);
 
 const parseClientMessage = (raw: string): ClientMessage | null => {
 	try {
@@ -66,16 +102,42 @@ const defaultState = (): SessionState => ({
 	activeSince: null,
 	activeMsToday: 0,
 	requestsInCurrentMinute: 0,
+	concurrentRequests: 0,
 	currentMinuteKey: minuteKey(new Date()),
 });
 
-const encode = (message: ServerMessage): string => JSON.stringify(message);
+const encodeEnvelope = (messages: ServerMessage[]): string =>
+	JSON.stringify({ messages } satisfies DurableEnvelope);
 
-const buildTranslationPrompt = (text: string, sourceLang: string, targetLang: string): string => {
+const parseEnvelope = (raw: string): DurableEnvelope | null => {
+	try {
+		const parsed: unknown = JSON.parse(raw);
+		if (
+			typeof parsed !== 'object' ||
+			parsed === null ||
+			!('messages' in parsed) ||
+			!Array.isArray((parsed as { messages: unknown }).messages)
+		) {
+			return null;
+		}
+
+		return parsed as DurableEnvelope;
+	} catch {
+		return null;
+	}
+};
+
+const buildTranslationPrompt = (
+	text: string,
+	sourceLang: string,
+	targetLang: string,
+): string => {
 	return `Translate from ${sourceLang} to ${targetLang}. Output ONLY the translation. Text: ${text}`;
 };
 
-const parseClaims = (payload: JWTPayload): { sub: string; deviceId: string } | null => {
+const parseClaims = (
+	payload: JWTPayload,
+): { sub: string; deviceId: string } | null => {
 	const sub = payload.sub;
 	const deviceId = payload.deviceId;
 
@@ -86,10 +148,48 @@ const parseClaims = (payload: JWTPayload): { sub: string; deviceId: string } | n
 	return { sub, deviceId };
 };
 
+const isLanguageSupported = (language: string): boolean =>
+	SUPPORTED_LANGUAGES.has(language);
+
+const isSuspiciousPromptInjection = (text: string): boolean => {
+	return /ignore\s+previous|system\s+prompt|developer\s+instruction/i.test(text);
+};
+
+const sanitizeText = (text: string): string => {
+	return text
+		.replace(/[`*_#[\]{}<>]/g, ' ')
+		.replace(/\s+/g, ' ')
+		.trim();
+};
+
+const toPrimaryHttpMessage = (messages: ServerMessage[]): ServerMessage => {
+	for (let index = messages.length - 1; index >= 0; index -= 1) {
+		const message = messages[index];
+		if (!message) {
+			continue;
+		}
+
+		if (
+			message.type !== 'rate_warning' &&
+			message.type !== 'session_warning' &&
+			message.type !== 'pong'
+		) {
+			return message;
+		}
+	}
+
+	return {
+		type: 'error',
+		code: 'invalid_payload',
+		message: 'No proxy message returned',
+	};
+};
+
 export class MyDurableObject {
 	private readonly state: DurableObjectState;
 	private readonly env: Env;
 	private readonly sessions = new Map<string, SessionState>();
+	private readonly authByConnection = new Map<string, AuthSession>();
 
 	constructor(state: DurableObjectState, env: Env) {
 		this.state = state;
@@ -129,110 +229,251 @@ export class MyDurableObject {
 		session.activeSince = nowMs;
 	}
 
-	private async handleAuth(message: Extract<ClientMessage, { type: 'auth' }>): Promise<ServerMessage> {
+	private getAuth(connectionId: string): AuthSession | null {
+		const auth = this.authByConnection.get(connectionId);
+		return auth ?? null;
+	}
+
+	private async handleAuth(
+		connectionId: string,
+		message: Extract<ClientMessage, { type: 'auth' }>,
+	): Promise<ServerMessage[]> {
 		try {
 			const secret = new TextEncoder().encode(this.env.JWT_SECRET);
 			const verified = await jwtVerify(message.token, secret);
 			const claims = parseClaims(verified.payload);
 
 			if (!claims) {
-				return {
-					type: 'error',
-					code: 'unauthorized',
-					message: 'Token claims are invalid',
-				};
+				return [
+					{
+						type: 'error',
+						code: 'unauthorized',
+						message: 'Token claims are invalid',
+					},
+				];
 			}
 
 			if (claims.deviceId !== message.deviceId) {
-				return {
-					type: 'error',
-					code: 'device_mismatch',
-					message: 'Token device mismatch',
-				};
+				return [
+					{
+						type: 'error',
+						code: 'device_mismatch',
+						message: 'Token device mismatch',
+					},
+				];
 			}
 
-			const session = this.getSession(claims.sub);
-			const remainingMs = Math.max(0, SESSION_LIMITS.dailySessionMs - session.activeMsToday);
+			const sessionId = `${claims.sub}-${Date.now()}`;
+			this.authByConnection.set(connectionId, {
+				userId: claims.sub,
+				deviceId: claims.deviceId,
+				sessionId,
+			});
 
-			return {
-				type: 'auth_ok',
-				sessionId: `session-${claims.sub}`,
-				dailyRemainingMs: remainingMs,
-				rpmRemaining: Math.max(0, RATE_LIMITS.perUserRequestsPerMinute - session.requestsInCurrentMinute),
-			};
+			const session = this.getSession(claims.sub);
+			const remainingMs = Math.max(
+				0,
+				SESSION_LIMITS.dailySessionMs - session.activeMsToday,
+			);
+
+			return [
+				{
+					type: 'auth_ok',
+					sessionId,
+					dailyRemainingMs: remainingMs,
+					rpmRemaining: Math.max(
+						0,
+						RATE_LIMITS.perUserRequestsPerMinute -
+							session.requestsInCurrentMinute,
+					),
+				},
+			];
 		} catch {
-			return {
-				type: 'error',
-				code: 'unauthorized',
-				message: 'Token verification failed',
-			};
+			return [
+				{
+					type: 'error',
+					code: 'unauthorized',
+					message: 'Token verification failed',
+				},
+			];
 		}
 	}
 
-	private async handleTranslate(message: Extract<ClientMessage, { type: 'translate' }>): Promise<ServerMessage> {
-		const userId = 'anonymous';
-		const session = this.getSession(userId);
+	private async handleTranslate(
+		connectionId: string,
+		message: Extract<ClientMessage, { type: 'translate' }>,
+	): Promise<ServerMessage[]> {
+		const auth = this.getAuth(connectionId);
+		if (!auth) {
+			return [
+				{
+					type: 'error',
+					code: 'session_required',
+					message: 'Authenticate before translate requests',
+					utteranceId: message.utteranceId,
+				},
+			];
+		}
+
+		if (
+			!isLanguageSupported(message.sourceLang) ||
+			!isLanguageSupported(message.targetLang)
+		) {
+			return [
+				{
+					type: 'error',
+					code: 'invalid_language',
+					message: 'Unsupported language pair',
+					utteranceId: message.utteranceId,
+				},
+			];
+		}
+
+		if (message.text.length > SESSION_LIMITS.maxCharsPerRequest) {
+			return [
+				{
+					type: 'error',
+					code: 'text_too_long',
+					message: `Text exceeds max length ${SESSION_LIMITS.maxCharsPerRequest}`,
+					utteranceId: message.utteranceId,
+				},
+			];
+		}
+
+		if (isSuspiciousPromptInjection(message.text)) {
+			return [
+				{
+					type: 'error',
+					code: 'invalid_payload',
+					message: 'Input contains blocked instruction-like patterns',
+					utteranceId: message.utteranceId,
+				},
+			];
+		}
+
+		const session = this.getSession(auth.userId);
 		const now = new Date();
 
 		this.rotateMinuteWindow(session, now);
 		this.trackActiveUsage(session, now.getTime());
 
 		if (session.activeMsToday >= SESSION_LIMITS.dailySessionMs) {
-			return {
-				type: 'session_expired',
-				resetAtUtc: '00:00:00Z',
-			};
+			return [
+				{
+					type: 'session_expired',
+					resetAtUtc: '00:00:00Z',
+				},
+			];
 		}
 
-		if (session.requestsInCurrentMinute >= RATE_LIMITS.perUserRequestsPerMinute) {
-			return {
-				type: 'rate_limited',
-				retryAfterMs: 1000,
-			};
+		if (session.concurrentRequests >= RATE_LIMITS.perUserConcurrentRequests) {
+			return [
+				{
+					type: 'rate_limited',
+					retryAfterMs: 1000,
+					utteranceId: message.utteranceId,
+				},
+			];
+		}
+
+		if (
+			session.requestsInCurrentMinute >= RATE_LIMITS.perUserRequestsPerMinute
+		) {
+			return [
+				{
+					type: 'rate_limited',
+					retryAfterMs: 1000,
+					utteranceId: message.utteranceId,
+				},
+			];
 		}
 
 		session.requestsInCurrentMinute += 1;
+		session.concurrentRequests += 1;
 
-		if (!this.env.GEMINI_API_KEY) {
-			return {
-				type: 'translation_chunk',
-				utteranceId: message.utteranceId,
-				chunk: `[${message.targetLang}] ${message.text}`,
-				done: true,
-			};
+		const messages: ServerMessage[] = [];
+
+		const remainingRpm =
+			RATE_LIMITS.perUserRequestsPerMinute - session.requestsInCurrentMinute;
+		if (
+			remainingRpm <=
+			Math.floor(
+				RATE_LIMITS.perUserRequestsPerMinute *
+					(1 - SESSION_LIMITS.warningThresholdRatio),
+			)
+		) {
+			messages.push({
+				type: 'rate_warning',
+				remaining: Math.max(0, remainingRpm),
+				limit: RATE_LIMITS.perUserRequestsPerMinute,
+			});
 		}
 
-		try {
-			const response = await fetch('https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent', {
-				method: 'POST',
-				headers: {
-					'content-type': 'application/json',
-					'x-goog-api-key': this.env.GEMINI_API_KEY,
-				},
-				body: JSON.stringify({
-					contents: [
-						{
-							role: 'user',
-							parts: [
-								{
-									text: buildTranslationPrompt(message.text, message.sourceLang, message.targetLang),
-								},
-							],
-						},
-					],
-					generationConfig: {
-						temperature: 0,
-					},
-				}),
+		const remainingDailyMs = Math.max(
+			0,
+			SESSION_LIMITS.dailySessionMs - session.activeMsToday,
+		);
+		if (
+			remainingDailyMs <=
+			SESSION_LIMITS.dailySessionMs * (1 - SESSION_LIMITS.warningThresholdRatio)
+		) {
+			messages.push({
+				type: 'session_warning',
+				dailyRemainingMs: remainingDailyMs,
 			});
+		}
+
+		const sanitizedText = sanitizeText(message.text);
+
+		try {
+			if (!this.env.GEMINI_API_KEY) {
+				messages.push({
+					type: 'translation_chunk',
+					utteranceId: message.utteranceId,
+					chunk: `[${message.targetLang}] ${sanitizedText}`,
+					done: true,
+				});
+				return messages;
+			}
+
+			const response = await fetch(
+				'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent',
+				{
+					method: 'POST',
+					headers: {
+						'content-type': 'application/json',
+						'x-goog-api-key': this.env.GEMINI_API_KEY,
+					},
+					body: JSON.stringify({
+						contents: [
+							{
+								role: 'user',
+								parts: [
+									{
+										text: buildTranslationPrompt(
+											sanitizedText,
+											message.sourceLang,
+											message.targetLang,
+										),
+									},
+								],
+							},
+						],
+						generationConfig: {
+							temperature: 0,
+						},
+					}),
+				},
+			);
 
 			if (!response.ok) {
-				return {
+				messages.push({
 					type: 'error',
 					code: 'translation_failed',
 					message: `Gemini request failed with status ${response.status}`,
 					utteranceId: message.utteranceId,
-				};
+				});
+				return messages;
 			}
 
 			const payload: unknown = await response.json();
@@ -241,77 +482,96 @@ export class MyDurableObject {
 				payload !== null &&
 				'candidates' in payload &&
 				Array.isArray((payload as { candidates: unknown }).candidates)
-					? (payload as { candidates: Array<{ content?: { parts?: Array<{ text?: string }> } }> }).candidates
+					? (payload as {
+							candidates: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
+					  }).candidates
 					: [];
 
 			const translation = candidates[0]?.content?.parts?.[0]?.text ?? '';
-
 			if (!translation) {
-				return {
+				messages.push({
 					type: 'error',
 					code: 'translation_failed',
 					message: 'Gemini returned an empty translation',
 					utteranceId: message.utteranceId,
-				};
+				});
+				return messages;
 			}
 
-			return {
+			messages.push({
 				type: 'translation_chunk',
 				utteranceId: message.utteranceId,
 				chunk: translation.trim(),
 				done: true,
-			};
+			});
+			return messages;
 		} catch (error) {
-			const messageText = error instanceof Error ? error.message : 'Translation request failed';
-			return {
+			messages.push({
 				type: 'error',
 				code: 'translation_failed',
-				message: messageText,
+				message:
+					error instanceof Error ? error.message : 'Translation request failed',
 				utteranceId: message.utteranceId,
-			};
+			});
+			return messages;
+		} finally {
+			session.concurrentRequests = Math.max(0, session.concurrentRequests - 1);
 		}
 	}
 
-	private async processRawMessage(raw: string): Promise<ServerMessage> {
+	private async processRawMessage(
+		connectionId: string,
+		raw: string,
+	): Promise<ServerMessage[]> {
 		const message = parseClientMessage(raw);
 
 		if (!message) {
-			return {
-				type: 'error',
-				code: 'invalid_payload',
-				message: 'Client message validation failed',
-			};
+			return [
+				{
+					type: 'error',
+					code: 'invalid_payload',
+					message: 'Client message validation failed',
+				},
+			];
 		}
 
 		switch (message.type) {
 			case 'ping':
-				return {
-					type: 'pong',
-					sentAt: message.sentAt,
-				};
+				return [
+					{
+						type: 'pong',
+						sentAt: message.sentAt,
+					},
+				];
 			case 'disconnect':
-				return {
-					type: 'error',
-					code: 'invalid_payload',
-					message: `Disconnected: ${message.reason}`,
-				};
+				this.authByConnection.delete(connectionId);
+				return [
+					{
+						type: 'pong',
+						sentAt: Date.now(),
+					},
+				];
 			case 'auth':
-				return this.handleAuth(message);
+				return this.handleAuth(connectionId, message);
 			case 'translate':
-				return this.handleTranslate(message);
+				return this.handleTranslate(connectionId, message);
 			default:
-				return {
-					type: 'error',
-					code: 'invalid_payload',
-					message: 'Unsupported message type',
-				};
+				return [
+					{
+						type: 'error',
+						code: 'invalid_payload',
+						message: 'Unsupported message type',
+					},
+				];
 		}
 	}
 
 	async fetch(request: Request): Promise<Response> {
 		const raw = await request.text();
-		const response = await this.processRawMessage(raw);
-		return new Response(encode(response), {
+		const connectionId = request.headers.get('x-connection-id') ?? 'unknown';
+		const messages = await this.processRawMessage(connectionId, raw);
+
+		return new Response(encodeEnvelope(messages), {
 			headers: {
 				'content-type': 'application/json',
 			},
@@ -336,16 +596,26 @@ app.post('/message', async (context) => {
 
 	const response = await stub.fetch('https://do/message', {
 		method: 'POST',
+		headers: {
+			'x-connection-id': 'http-legacy',
+		},
 		body,
 	});
 
 	const text = await response.text();
-	return new Response(text, {
-		status: response.status,
-		headers: {
-			'content-type': 'application/json',
-		},
-	});
+	const envelope = parseEnvelope(text);
+	if (!envelope || envelope.messages.length === 0) {
+		return context.json(
+			{
+				type: 'error',
+				code: 'invalid_payload',
+				message: 'Proxy returned empty response',
+			} satisfies ServerMessage,
+			500,
+		);
+	}
+
+	return context.json(toPrimaryHttpMessage(envelope.messages));
 });
 
 app.get('/ws', async (context) => {
@@ -358,6 +628,7 @@ app.get('/ws', async (context) => {
 	const pair = new WebSocketPair();
 	const client = pair[0];
 	const server = pair[1];
+	const connectionId = crypto.randomUUID();
 
 	const stub = getDurableStub(context.env);
 	server.accept();
@@ -365,25 +636,53 @@ app.get('/ws', async (context) => {
 	server.addEventListener('message', async (event: MessageEvent) => {
 		if (typeof event.data !== 'string') {
 			server.send(
-				encode({
+				JSON.stringify({
 					type: 'error',
 					code: 'invalid_payload',
 					message: 'Only string payloads are supported',
-				}),
+				} satisfies ServerMessage),
 			);
 			return;
 		}
 
 		const response = await stub.fetch('https://do/message', {
 			method: 'POST',
+			headers: {
+				'x-connection-id': connectionId,
+			},
 			body: event.data,
 		});
 
-		server.send(await response.text());
+		const text = await response.text();
+		const envelope = parseEnvelope(text);
+
+		if (!envelope || envelope.messages.length === 0) {
+			server.send(
+				JSON.stringify({
+					type: 'error',
+					code: 'invalid_payload',
+					message: 'Proxy returned empty response',
+				} satisfies ServerMessage),
+			);
+			return;
+		}
+
+		envelope.messages.forEach((message) => {
+			server.send(JSON.stringify(message));
+		});
 	});
 
-	server.addEventListener('close', () => {
-		server.close();
+	server.addEventListener('close', async () => {
+		await stub.fetch('https://do/message', {
+			method: 'POST',
+			headers: {
+				'x-connection-id': connectionId,
+			},
+			body: JSON.stringify({
+				type: 'disconnect',
+				reason: 'shutdown',
+			} satisfies ClientMessage),
+		});
 	});
 
 	return new Response(null, {

@@ -6,6 +6,7 @@ import {
   globalShortcut,
   ipcMain,
 } from "electron";
+import { execSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import started from "electron-squirrel-startup";
@@ -17,6 +18,7 @@ import {
 import {
   TranslationProxyClient,
   type ProxyConnectionState,
+  type ServerMessage,
 } from "./proxy-client";
 
 type MeetingLifecycle = "idle" | "prompt" | "active" | "stopping";
@@ -50,6 +52,11 @@ interface PipelineUtterance {
   confidence: number;
 }
 
+interface RateWarning {
+  remaining: number;
+  limit: number;
+}
+
 interface PipelineSnapshot {
   isRunning: boolean;
   proxyConnection: ProxyConnectionState;
@@ -58,16 +65,55 @@ interface PipelineSnapshot {
   meetingDecision: DetectionDecision;
   autoStopSecondsRemaining: number | null;
   utterances: PipelineUtterance[];
+  rateWarning: RateWarning | null;
+  dailyRemainingMs: number | null;
+  sessionResetAtUtc: string | null;
+  lastProxyNotice: string | null;
+  activeLanguagePair: string;
 }
+
+const MEETING_PROCESS_HINTS = [
+  "zoom",
+  "teams",
+  "slack",
+  "discord",
+  "webex",
+  "meet",
+] as const;
+
+const YOU_SOURCE_LANG = "en-US";
+const YOU_TARGET_LANG = "hi-IN";
+const THEM_SOURCE_LANG = "es-ES";
+const THEM_TARGET_LANG = "en-US";
+
+const YOU_PHRASES = [
+  "Can everyone hear me clearly?",
+  "Let's begin the architecture review.",
+  "Please share your deployment status.",
+  "I will summarize the action items.",
+] as const;
+
+const THEM_PHRASES = [
+  "Audio is clear from our side.",
+  "The API rollout is currently stable.",
+  "We completed integration testing.",
+  "I will send the final notes shortly.",
+] as const;
 
 let overlayWindow: BrowserWindow | null = null;
 let tray: Tray | null = null;
 
 const utterances = new Map<string, PipelineUtterance>();
-let pipelineIntervals: NodeJS.Timeout[] = [];
+let pipelineTimers: NodeJS.Timeout[] = [];
 let isPipelineRunning = false;
 let utteranceSequence = 0;
 let proxyConnectionState: ProxyConnectionState = "disconnected";
+let lastSpeechAt = 0;
+
+let rateWarning: RateWarning | null = null;
+let dailyRemainingMs: number | null = null;
+let sessionResetAtUtc: string | null = null;
+let lastProxyNotice: string | null = null;
 
 let meetingSnapshot: MeetingSnapshot = {
   lifecycle: "idle",
@@ -83,20 +129,6 @@ let meetingSnapshot: MeetingSnapshot = {
   },
   autoStopSecondsRemaining: null,
 };
-
-const youPhrases = [
-  "Can everyone hear me clearly?",
-  "Let's begin the architecture review.",
-  "Please share your deployment status.",
-  "I will summarize the action items.",
-] as const;
-
-const themPhrases = [
-  "Audio is clear from our side.",
-  "The API rollout is currently stable.",
-  "We completed integration testing.",
-  "I will send the final notes shortly.",
-] as const;
 
 if (started) {
   app.quit();
@@ -126,6 +158,8 @@ const compareUtterances = (
   return delta;
 };
 
+const activeLanguagePair = (): string => `${YOU_SOURCE_LANG} → ${YOU_TARGET_LANG}`;
+
 const getSnapshot = (): PipelineSnapshot => {
   const ordered = [...utterances.values()].sort(compareUtterances);
   return {
@@ -136,6 +170,11 @@ const getSnapshot = (): PipelineSnapshot => {
     meetingDecision: meetingSnapshot.evaluation.decision,
     autoStopSecondsRemaining: meetingSnapshot.autoStopSecondsRemaining,
     utterances: ordered,
+    rateWarning,
+    dailyRemainingMs,
+    sessionResetAtUtc,
+    lastProxyNotice,
+    activeLanguagePair: activeLanguagePair(),
   };
 };
 
@@ -147,12 +186,54 @@ const emitSnapshot = (): void => {
   overlayWindow.webContents.send("pipelines:update", getSnapshot());
 };
 
+const handleProxyServerMessage = (message: ServerMessage): void => {
+  switch (message.type) {
+    case "auth_ok":
+      dailyRemainingMs = message.dailyRemainingMs;
+      sessionResetAtUtc = null;
+      lastProxyNotice = null;
+      break;
+    case "rate_warning":
+      rateWarning = {
+        remaining: message.remaining,
+        limit: message.limit,
+      };
+      break;
+    case "session_warning":
+      dailyRemainingMs = message.dailyRemainingMs;
+      break;
+    case "session_expired":
+      sessionResetAtUtc = message.resetAtUtc;
+      lastProxyNotice = `Session expired. Resets at ${message.resetAtUtc}`;
+      break;
+    case "rate_limited":
+      lastProxyNotice = `Rate limited. Retry after ${message.retryAfterMs}ms`;
+      break;
+    case "error":
+      if (!message.utteranceId) {
+        lastProxyNotice = message.message;
+      }
+      break;
+    case "translation_chunk":
+    case "pong":
+      break;
+  }
+
+  emitSnapshot();
+};
+
 const proxyClient = new TranslationProxyClient({
   url: process.env.PROXY_WS_URL ?? "ws://127.0.0.1:8787/ws",
   onConnectionStateChange: (state) => {
     proxyConnectionState = state;
+
+    if (state === "connected") {
+      lastProxyNotice = null;
+    }
+
     emitSnapshot();
   },
+  onServerMessage: handleProxyServerMessage,
 });
 
 const toOverlayBounds = (window: BrowserWindow): OverlayBounds => {
@@ -215,7 +296,11 @@ const translateUtterance = async (
   }
 };
 
-const createPipelineUtterance = (speaker: Speaker): string => {
+const createPipelineUtterance = (
+  speaker: Speaker,
+  sourceLang: string,
+  targetLang: string,
+): string => {
   const timestamp = Date.now();
   utteranceSequence += 1;
 
@@ -228,8 +313,8 @@ const createPipelineUtterance = (speaker: Speaker): string => {
     status: "listening",
     originalText: "",
     translatedText: "",
-    sourceLang: speaker === "you" ? "en-US" : "es-ES",
-    targetLang: speaker === "you" ? "hi-IN" : "en-US",
+    sourceLang,
+    targetLang,
     confidence: 0,
   };
 
@@ -247,38 +332,49 @@ const scheduleStateProgression = (
     updateUtterance(utteranceId, {
       status: "transcribing",
       originalText: phrase,
-      confidence: 0.93,
+      confidence: 0.92,
     });
-  }, 250);
+  }, 220);
 
   const translatingTimer = setTimeout(() => {
     updateUtterance(utteranceId, {
       status: "translating",
       originalText: phrase,
-      confidence: 0.95,
+      confidence: 0.96,
     });
 
     void translateUtterance(utteranceId, phrase);
   }, 700);
 
-  pipelineIntervals.push(transcribingTimer, translatingTimer);
+  pipelineTimers.push(transcribingTimer, translatingTimer);
 };
 
 const runPipelineTick = (speaker: Speaker): void => {
-  const phrasePool = speaker === "you" ? youPhrases : themPhrases;
+  const phrasePool = speaker === "you" ? YOU_PHRASES : THEM_PHRASES;
   const phrase = phrasePool[utteranceSequence % phrasePool.length];
 
-  const utteranceId = createPipelineUtterance(speaker);
+  const utteranceId =
+    speaker === "you"
+      ? createPipelineUtterance(speaker, YOU_SOURCE_LANG, YOU_TARGET_LANG)
+      : createPipelineUtterance(speaker, THEM_SOURCE_LANG, THEM_TARGET_LANG);
+
+  lastSpeechAt = Date.now();
   scheduleStateProgression(utteranceId, phrase);
 };
 
 const clearPipelineTimers = (): void => {
-  pipelineIntervals.forEach((timer) => {
+  pipelineTimers.forEach((timer) => {
     clearTimeout(timer);
     clearInterval(timer);
   });
 
-  pipelineIntervals = [];
+  pipelineTimers = [];
+};
+
+const clearUtterances = (): PipelineSnapshot => {
+  utterances.clear();
+  emitSnapshot();
+  return getSnapshot();
 };
 
 const startPipelines = (): PipelineSnapshot => {
@@ -287,10 +383,16 @@ const startPipelines = (): PipelineSnapshot => {
   }
 
   isPipelineRunning = true;
+  rateWarning = null;
+  sessionResetAtUtc = null;
+  lastProxyNotice = null;
+
   emitSnapshot();
 
-  void proxyClient.connect().catch(() => {
+  void proxyClient.connect().catch((error) => {
     proxyConnectionState = "error";
+    lastProxyNotice =
+      error instanceof Error ? error.message : "Unable to connect proxy";
     emitSnapshot();
   });
 
@@ -299,13 +401,13 @@ const startPipelines = (): PipelineSnapshot => {
 
   const youInterval = setInterval(() => {
     runPipelineTick("you");
-  }, 6000);
+  }, 5800);
 
   const themInterval = setInterval(() => {
     runPipelineTick("them");
-  }, 5000);
+  }, 5200);
 
-  pipelineIntervals.push(youInterval, themInterval);
+  pipelineTimers.push(youInterval, themInterval);
 
   return getSnapshot();
 };
@@ -313,7 +415,7 @@ const startPipelines = (): PipelineSnapshot => {
 const stopPipelines = (): PipelineSnapshot => {
   isPipelineRunning = false;
   clearPipelineTimers();
-  proxyClient.disconnect();
+  proxyClient.disconnect("meeting_ended");
   emitSnapshot();
   return getSnapshot();
 };
@@ -349,10 +451,10 @@ const resolveTrayIconPath = (): string => {
 
 const createOverlayWindow = (): BrowserWindow => {
   const window = new BrowserWindow({
-    width: 780,
-    height: 320,
-    x: 200,
-    y: 600,
+    width: 980,
+    height: 440,
+    x: 160,
+    y: 580,
     frame: false,
     transparent: true,
     alwaysOnTop: true,
@@ -388,15 +490,21 @@ const createTray = (): void => {
       },
     },
     {
-      label: "Start Pipelines",
+      label: "Start Translation",
       click: () => {
         startPipelines();
       },
     },
     {
-      label: "Stop Pipelines",
+      label: "Stop Translation",
       click: () => {
         stopPipelines();
+      },
+    },
+    {
+      label: "Clear Captions",
+      click: () => {
+        clearUtterances();
       },
     },
     {
@@ -427,6 +535,10 @@ const registerShortcuts = (): void => {
 
     startPipelines();
   });
+
+  globalShortcut.register("CommandOrControl+Shift+K", () => {
+    clearUtterances();
+  });
 };
 
 const registerIpcHandlers = (): void => {
@@ -450,27 +562,49 @@ const registerIpcHandlers = (): void => {
 
   ipcMain.handle("pipelines:start", () => startPipelines());
   ipcMain.handle("pipelines:stop", () => stopPipelines());
+  ipcMain.handle("pipelines:clear", () => clearUtterances());
   ipcMain.handle("pipelines:get", () => getSnapshot());
 };
 
-let simulatedSignalTick = 0;
+const processList = (): string[] => {
+  try {
+    if (process.platform === "win32") {
+      const stdout = execSync("tasklist", { encoding: "utf-8" });
+      return stdout
+        .split("\n")
+        .map((line) => line.trim().toLowerCase())
+        .filter(Boolean);
+    }
 
-const readSimulatedSignals = () => {
-  simulatedSignalTick += 1;
+    const stdout = execSync("ps -A -o comm=", { encoding: "utf-8" });
+    return stdout
+      .split("\n")
+      .map((line) => path.basename(line.trim()).toLowerCase())
+      .filter(Boolean);
+  } catch {
+    return [];
+  }
+};
 
-  const cycle = simulatedSignalTick % 20;
-  const activeMeeting = cycle >= 3 && cycle <= 16;
+const readRuntimeSignals = () => {
+  const processes = processList();
+
+  const meetingProcessActive = processes.some((processName) =>
+    MEETING_PROCESS_HINTS.some((hint) => processName.includes(hint)),
+  );
+
+  const browserUrlMatched = meetingProcessActive;
 
   return {
-    browserUrlMatched: activeMeeting && cycle % 2 === 0,
-    meetingProcessActive: activeMeeting,
-    microphoneInUse: activeMeeting && isPipelineRunning,
-    systemSpeechDetected: activeMeeting && cycle % 3 !== 0,
+    browserUrlMatched,
+    meetingProcessActive,
+    microphoneInUse: isPipelineRunning,
+    systemSpeechDetected: Date.now() - lastSpeechAt < 6000,
   };
 };
 
 const meetingOrchestrator = new MeetingOrchestrator({
-  readSignals: readSimulatedSignals,
+  readSignals: readRuntimeSignals,
   onSnapshot: (snapshot) => {
     meetingSnapshot = snapshot;
     emitSnapshot();
