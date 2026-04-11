@@ -1,0 +1,154 @@
+html,
+body {
+  margin: 0;
+  padding: 0;
+  background: transparent;
+  font-family: "Inter", system-ui, -apple-system, sans-serif;
+}
+
+.overlay-root {
+  box-sizing: border-box;
+  width: 100%;
+  min-height: 100vh;
+  padding: 14px;
+  color: #f8fafc;
+  background: rgba(0, 0, 0, 0.82);
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  backdrop-filter: blur(8px);
+  display: grid;
+  gap: 10px;
+}
+
+.overlay-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+}
+
+.overlay-header strong {
+  display: block;
+  font-size: 14px;
+}
+
+.overlay-header p {
+  margin: 4px 0 0;
+  font-size: 12px;
+  color: #d1d5db;
+}
+
+.header-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.header-actions button {
+  border: 1px solid #60a5fa;
+  background: #1e3a8a;
+  color: #e0f2fe;
+  border-radius: 8px;
+  padding: 6px 10px;
+  cursor: pointer;
+}
+
+.overlay-status-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px;
+  font-size: 12px;
+  color: #dbeafe;
+}
+
+.overlay-body {
+  display: grid;
+  gap: 8px;
+  max-height: 200px;
+  overflow: auto;
+}
+
+.state-card {
+  border-radius: 8px;
+  padding: 8px 10px;
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  display: grid;
+  gap: 6px;
+}
+
+.state-card header,
+.state-card footer {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+}
+
+.state-card time,
+.confidence {
+  margin-left: auto;
+}
+
+.state-card p {
+  margin: 0;
+  font-size: 13px;
+}
+
+.original {
+  color: #f9fafb;
+  font-weight: 600;
+}
+
+.translated {
+  color: #d1d5db;
+}
+
+.speaker {
+  font-size: 11px;
+  letter-spacing: 0.06em;
+}
+
+.speaker.you {
+  color: #86efac;
+}
+
+.speaker.them {
+  color: #93c5fd;
+}
+
+.state {
+  font-size: 11px;
+  text-transform: uppercase;
+}
+
+.state-listening {
+  background: rgba(20, 83, 45, 0.5);
+}
+
+.state-transcribing {
+  background: rgba(88, 28, 135, 0.5);
+}
+
+.state-translating {
+  background: rgba(146, 64, 14, 0.5);
+}
+
+.state-done {
+  background: rgba(30, 64, 175, 0.45);
+}
+
+.state-failed {
+  background: rgba(127, 29, 29, 0.5);
+}
+
+.overlay-footer {
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+  font-size: 11px;
+  color: #cbd5e1;
+}
+
+.empty {
+  margin: 0;
+  font-size: 13px;
+  color: #cbd5e1;
+}
