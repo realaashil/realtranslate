@@ -1,5 +1,5 @@
 import { Hono } from 'hono';
-import { jwtVerify, type JWTPayload } from 'jose';
+import { createRemoteJWKSet, jwtVerify, type JWTPayload } from 'jose';
 import {
 	RATE_LIMITS,
 	SESSION_LIMITS,
@@ -10,7 +10,11 @@ import { z } from 'zod';
 
 interface Env {
 	MY_DURABLE_OBJECT: DurableObjectNamespace;
-	JWT_SECRET: string;
+	SUPABASE_URL: string;
+	SUPABASE_JWT_AUDIENCE?: string;
+	SUPABASE_JWT_ISSUER?: string;
+	ALLOW_LEGACY_DEV_JWT?: string;
+	JWT_SECRET?: string;
 	GEMINI_API_KEY?: string;
 }
 
@@ -135,17 +139,14 @@ const buildTranslationPrompt = (
 	return `Translate from ${sourceLang} to ${targetLang}. Output ONLY the translation. Text: ${text}`;
 };
 
-const parseClaims = (
-	payload: JWTPayload,
-): { sub: string; deviceId: string } | null => {
+const parseClaims = (payload: JWTPayload): { sub: string } | null => {
 	const sub = payload.sub;
-	const deviceId = payload.deviceId;
 
-	if (typeof sub !== 'string' || typeof deviceId !== 'string') {
+	if (typeof sub !== 'string') {
 		return null;
 	}
 
-	return { sub, deviceId };
+	return { sub };
 };
 
 const isLanguageSupported = (language: string): boolean =>
@@ -185,15 +186,35 @@ const toPrimaryHttpMessage = (messages: ServerMessage[]): ServerMessage => {
 	};
 };
 
+const parseBooleanFlag = (value: string | undefined): boolean => {
+	if (!value) {
+		return false;
+	}
+
+	return value.toLowerCase() === 'true' || value === '1';
+};
+
 export class MyDurableObject {
 	private readonly state: DurableObjectState;
 	private readonly env: Env;
 	private readonly sessions = new Map<string, SessionState>();
 	private readonly authByConnection = new Map<string, AuthSession>();
+	private readonly supabaseJWKS: ReturnType<typeof createRemoteJWKSet>;
+	private readonly supabaseIssuer: string;
+	private readonly supabaseAudience: string;
+	private readonly allowLegacyDevJWT: boolean;
 
 	constructor(state: DurableObjectState, env: Env) {
 		this.state = state;
 		this.env = env;
+
+		this.supabaseIssuer =
+			env.SUPABASE_JWT_ISSUER || `${env.SUPABASE_URL}/auth/v1`;
+		this.supabaseAudience = env.SUPABASE_JWT_AUDIENCE || 'authenticated';
+		this.supabaseJWKS = createRemoteJWKSet(
+			new URL(`${env.SUPABASE_URL}/auth/v1/.well-known/jwks.json`),
+		);
+		this.allowLegacyDevJWT = parseBooleanFlag(env.ALLOW_LEGACY_DEV_JWT);
 	}
 
 	private getSession(userId: string): SessionState {
@@ -234,61 +255,37 @@ export class MyDurableObject {
 		return auth ?? null;
 	}
 
+	private async verifyTokenClaims(
+		token: string,
+	): Promise<{ sub: string } | null> {
+		try {
+			const verified = await jwtVerify(token, this.supabaseJWKS, {
+				issuer: this.supabaseIssuer,
+				audience: this.supabaseAudience,
+			});
+			return parseClaims(verified.payload);
+		} catch {
+			if (!this.allowLegacyDevJWT || !this.env.JWT_SECRET) {
+				return null;
+			}
+
+			try {
+				const secret = new TextEncoder().encode(this.env.JWT_SECRET);
+				const verified = await jwtVerify(token, secret);
+				return parseClaims(verified.payload);
+			} catch {
+				return null;
+			}
+		}
+	}
+
 	private async handleAuth(
 		connectionId: string,
 		message: Extract<ClientMessage, { type: 'auth' }>,
 	): Promise<ServerMessage[]> {
-		try {
-			const secret = new TextEncoder().encode(this.env.JWT_SECRET);
-			const verified = await jwtVerify(message.token, secret);
-			const claims = parseClaims(verified.payload);
+		const claims = await this.verifyTokenClaims(message.token);
 
-			if (!claims) {
-				return [
-					{
-						type: 'error',
-						code: 'unauthorized',
-						message: 'Token claims are invalid',
-					},
-				];
-			}
-
-			if (claims.deviceId !== message.deviceId) {
-				return [
-					{
-						type: 'error',
-						code: 'device_mismatch',
-						message: 'Token device mismatch',
-					},
-				];
-			}
-
-			const sessionId = `${claims.sub}-${Date.now()}`;
-			this.authByConnection.set(connectionId, {
-				userId: claims.sub,
-				deviceId: claims.deviceId,
-				sessionId,
-			});
-
-			const session = this.getSession(claims.sub);
-			const remainingMs = Math.max(
-				0,
-				SESSION_LIMITS.dailySessionMs - session.activeMsToday,
-			);
-
-			return [
-				{
-					type: 'auth_ok',
-					sessionId,
-					dailyRemainingMs: remainingMs,
-					rpmRemaining: Math.max(
-						0,
-						RATE_LIMITS.perUserRequestsPerMinute -
-							session.requestsInCurrentMinute,
-					),
-				},
-			];
-		} catch {
+		if (!claims) {
 			return [
 				{
 					type: 'error',
@@ -297,6 +294,32 @@ export class MyDurableObject {
 				},
 			];
 		}
+
+		const sessionId = `${claims.sub}-${Date.now()}`;
+		this.authByConnection.set(connectionId, {
+			userId: claims.sub,
+			deviceId: message.deviceId,
+			sessionId,
+		});
+
+		const session = this.getSession(claims.sub);
+		const remainingMs = Math.max(
+			0,
+			SESSION_LIMITS.dailySessionMs - session.activeMsToday,
+		);
+
+		return [
+			{
+				type: 'auth_ok',
+				sessionId,
+				dailyRemainingMs: remainingMs,
+				rpmRemaining: Math.max(
+					0,
+					RATE_LIMITS.perUserRequestsPerMinute -
+						session.requestsInCurrentMinute,
+				),
+			},
+		];
 	}
 
 	private async handleTranslate(

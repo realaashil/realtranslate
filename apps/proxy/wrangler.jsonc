@@ -17,6 +17,10 @@
     ]
   },
   "vars": {
+    "SUPABASE_URL": "https://your-project-ref.supabase.co",
+    "SUPABASE_JWT_AUDIENCE": "authenticated",
+    "SUPABASE_JWT_ISSUER": "",
+    "ALLOW_LEGACY_DEV_JWT": "false",
     "JWT_SECRET": "replace-me",
     "GEMINI_API_KEY": ""
   },
