@@ -24,10 +24,18 @@ type ProxyConnectionState =
 
 type MeetingLifecycle = "idle" | "prompt" | "active" | "stopping";
 type DetectionDecision = "auto-start" | "prompt" | "idle";
+type AuthStatus = "signed_out" | "signing_in" | "signed_in";
 
 interface RateWarning {
   remaining: number;
   limit: number;
+}
+
+interface AuthSnapshot {
+  status: AuthStatus;
+  email: string | null;
+  userId: string | null;
+  error: string | null;
 }
 
 interface PipelineUtterance {
@@ -55,6 +63,7 @@ interface PipelineSnapshot {
   sessionResetAtUtc: string | null;
   lastProxyNotice: string | null;
   activeLanguagePair: string;
+  auth: AuthSnapshot;
 }
 
 const root = document.createElement("main");
@@ -72,6 +81,23 @@ root.innerHTML = `
       <button id="clear-btn" type="button">Clear</button>
     </div>
   </header>
+
+  <section class="auth-panel" id="auth-panel">
+    <div class="auth-summary">
+      <span class="status-label">Authentication</span>
+      <span id="auth-state" class="status-chip">signed_out</span>
+      <span id="auth-user" class="auth-user">Not signed in</span>
+    </div>
+
+    <form id="auth-form" class="auth-form">
+      <input id="auth-email" type="email" placeholder="you@example.com" required />
+      <input id="auth-password" type="password" placeholder="Password" required />
+      <button id="auth-signin" type="submit">Sign in</button>
+      <button id="auth-signout" type="button">Sign out</button>
+    </form>
+
+    <p id="auth-error" class="auth-error"></p>
+  </section>
 
   <section class="status-row">
     <article class="status-card">
@@ -120,6 +146,14 @@ const dailyNode = document.getElementById("daily-line");
 const rateNode = document.getElementById("rate-line");
 const proxyNoticeNode = document.getElementById("proxy-notice");
 const utteranceListNode = document.getElementById("utterance-list");
+const authStateNode = document.getElementById("auth-state");
+const authUserNode = document.getElementById("auth-user");
+const authErrorNode = document.getElementById("auth-error");
+const authForm = document.getElementById("auth-form") as HTMLFormElement | null;
+const authEmailInput = document.getElementById("auth-email") as HTMLInputElement | null;
+const authPasswordInput = document.getElementById("auth-password") as HTMLInputElement | null;
+const authSignInButton = document.getElementById("auth-signin") as HTMLButtonElement | null;
+const authSignOutButton = document.getElementById("auth-signout") as HTMLButtonElement | null;
 const toggleButton = document.getElementById("toggle-btn");
 const pipelineButton = document.getElementById("pipeline-btn");
 const clearButton = document.getElementById("clear-btn");
@@ -180,11 +214,16 @@ const renderUtterance = (utterance: PipelineUtterance): string => {
 };
 
 const chipClass = (value: string): string => {
-  if (value === "connected" || value === "running" || value === "active") {
+  if (value === "connected" || value === "running" || value === "active" || value === "signed_in") {
     return "status-chip ok";
   }
 
-  if (value === "reconnecting" || value === "prompt" || value === "stopping") {
+  if (
+    value === "reconnecting" ||
+    value === "prompt" ||
+    value === "stopping" ||
+    value === "signing_in"
+  ) {
     return "status-chip warn";
   }
 
@@ -195,7 +234,40 @@ const chipClass = (value: string): string => {
   return "status-chip";
 };
 
+const renderAuth = (auth: AuthSnapshot): void => {
+  if (authStateNode) {
+    authStateNode.textContent = auth.status;
+    authStateNode.className = chipClass(auth.status);
+  }
+
+  if (authUserNode) {
+    authUserNode.textContent = auth.email ?? "Not signed in";
+  }
+
+  if (authErrorNode) {
+    authErrorNode.textContent = auth.error ?? "";
+  }
+
+  if (authSignInButton) {
+    authSignInButton.disabled = auth.status === "signing_in" || auth.status === "signed_in";
+  }
+
+  if (authSignOutButton) {
+    authSignOutButton.disabled = auth.status !== "signed_in";
+  }
+
+  if (authEmailInput) {
+    authEmailInput.disabled = auth.status === "signing_in" || auth.status === "signed_in";
+  }
+
+  if (authPasswordInput) {
+    authPasswordInput.disabled = auth.status === "signing_in" || auth.status === "signed_in";
+  }
+};
+
 const renderSnapshot = (snapshot: PipelineSnapshot): void => {
+  renderAuth(snapshot.auth);
+
   if (pipelineStateNode) {
     const mode = snapshot.isRunning ? "running" : "stopped";
     pipelineStateNode.textContent = mode;
@@ -248,6 +320,7 @@ const renderSnapshot = (snapshot: PipelineSnapshot): void => {
 
   if (pipelineButton) {
     pipelineButton.textContent = snapshot.isRunning ? "Stop" : "Start";
+    pipelineButton.toggleAttribute("disabled", snapshot.auth.status !== "signed_in");
   }
 
   if (!utteranceListNode) {
@@ -256,7 +329,7 @@ const renderSnapshot = (snapshot: PipelineSnapshot): void => {
 
   if (snapshot.utterances.length === 0) {
     utteranceListNode.innerHTML =
-      '<p class="empty">No captions yet. Start translation or wait for meeting auto-detection.</p>';
+      '<p class="empty">No captions yet. Sign in and start translation or wait for meeting auto-detection.</p>';
     return;
   }
 
@@ -272,6 +345,12 @@ const updateBounds = async (): Promise<void> => {
     boundsNode.textContent = formatBounds(bounds);
   }
 };
+
+if (!window.overlay || !window.pipelines || !window.auth) {
+  throw new Error(
+    "Preload bridge unavailable. Ensure desktop app is running via Electron Forge (pnpm dev:desktop).",
+  );
+}
 
 if (toggleButton) {
   toggleButton.addEventListener("click", async () => {
@@ -298,10 +377,43 @@ if (clearButton) {
   });
 }
 
-if (!window.overlay || !window.pipelines) {
-  throw new Error(
-    "Preload bridge unavailable. Ensure desktop app is running via Electron Forge (pnpm dev:desktop).",
-  );
+if (authForm) {
+  authForm.addEventListener("submit", async (event) => {
+    event.preventDefault();
+
+    if (!authEmailInput || !authPasswordInput) {
+      return;
+    }
+
+    const email = authEmailInput.value.trim();
+    const password = authPasswordInput.value;
+
+    try {
+      await window.auth.signIn({ email, password });
+      const latest = await window.pipelines.get();
+      renderSnapshot(latest);
+    } catch (error) {
+      if (authErrorNode) {
+        authErrorNode.textContent =
+          error instanceof Error ? error.message : "Sign in failed";
+      }
+    }
+  });
+}
+
+if (authSignOutButton) {
+  authSignOutButton.addEventListener("click", async () => {
+    try {
+      await window.auth.signOut();
+      const latest = await window.pipelines.get();
+      renderSnapshot(latest);
+    } catch (error) {
+      if (authErrorNode) {
+        authErrorNode.textContent =
+          error instanceof Error ? error.message : "Sign out failed";
+      }
+    }
+  });
 }
 
 const unsubscribe = window.pipelines.onUpdate((snapshot) => {
@@ -310,6 +422,7 @@ const unsubscribe = window.pipelines.onUpdate((snapshot) => {
 
 void (async () => {
   await updateBounds();
+  await window.auth.get();
   const initial = await window.pipelines.get();
   renderSnapshot(initial);
 })();
