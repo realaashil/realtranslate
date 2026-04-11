@@ -135,7 +135,10 @@ if (started) {
 }
 
 const getRendererUrl = (): string => {
-  if (MAIN_WINDOW_VITE_DEV_SERVER_URL) {
+  if (
+    typeof MAIN_WINDOW_VITE_DEV_SERVER_URL === "string" &&
+    MAIN_WINDOW_VITE_DEV_SERVER_URL.length > 0
+  ) {
     return MAIN_WINDOW_VITE_DEV_SERVER_URL;
   }
 
@@ -143,6 +146,21 @@ const getRendererUrl = (): string => {
     __dirname,
     `../renderer/${MAIN_WINDOW_VITE_NAME}/index.html`,
   )}`;
+};
+
+const resolvePreloadPath = (): string => {
+  const candidates = [
+    path.join(__dirname, "preload.js"),
+    path.join(process.cwd(), ".vite/build/preload.js"),
+    path.join(process.cwd(), "apps/desktop/.vite/build/preload.js"),
+  ];
+
+  const found = candidates.find((candidate) => fs.existsSync(candidate));
+  if (!found) {
+    throw new Error("Preload bundle not found");
+  }
+
+  return found;
 };
 
 const compareUtterances = (
@@ -450,6 +468,8 @@ const resolveTrayIconPath = (): string => {
 };
 
 const createOverlayWindow = (): BrowserWindow => {
+  const preloadPath = resolvePreloadPath();
+
   const window = new BrowserWindow({
     width: 980,
     height: 440,
@@ -461,13 +481,16 @@ const createOverlayWindow = (): BrowserWindow => {
     hasShadow: false,
     resizable: true,
     webPreferences: {
-      preload: path.join(__dirname, "preload.js"),
+      preload: preloadPath,
       contextIsolation: true,
       nodeIntegration: false,
     },
   });
 
-  if (MAIN_WINDOW_VITE_DEV_SERVER_URL) {
+  if (
+    typeof MAIN_WINDOW_VITE_DEV_SERVER_URL === "string" &&
+    MAIN_WINDOW_VITE_DEV_SERVER_URL.length > 0
+  ) {
     window.loadURL(getRendererUrl());
   } else {
     window.loadFile(

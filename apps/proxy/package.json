@@ -6,6 +6,7 @@
 		"deploy": "wrangler deploy",
 		"dev": "wrangler dev",
 		"start": "wrangler dev",
+		"dev:token": "node ./scripts/generate-dev-token.mjs --env",
 		"cf-typegen": "wrangler types",
 		"lint": "tsc --noEmit",
 		"check-types": "tsc --noEmit"

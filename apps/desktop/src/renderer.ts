@@ -298,6 +298,12 @@ if (clearButton) {
   });
 }
 
+if (!window.overlay || !window.pipelines) {
+  throw new Error(
+    "Preload bridge unavailable. Ensure desktop app is running via Electron Forge (pnpm dev:desktop).",
+  );
+}
+
 const unsubscribe = window.pipelines.onUpdate((snapshot) => {
   renderSnapshot(snapshot);
 });
