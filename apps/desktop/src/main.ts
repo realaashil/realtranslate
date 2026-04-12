@@ -171,8 +171,8 @@ const supabasePublishableKey =
   process.env.SUPABASE_PUBLISHABLE_KEY ?? process.env.SUPABASE_ANON_KEY;
 
 if (!supabaseUrl || !supabasePublishableKey) {
-  throw new Error(
-    "Missing SUPABASE_URL or SUPABASE_PUBLISHABLE_KEY for desktop auth",
+  console.error(
+    "Missing SUPABASE_URL or SUPABASE_PUBLISHABLE_KEY — auth will not work. Set these env vars at build time.",
   );
 }
 
