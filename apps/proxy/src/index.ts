@@ -1,7 +1,7 @@
 import { Hono } from "hono";
 import { cors } from "hono/cors";
-import { createRemoteJWKSet, jwtVerify, type JWTPayload } from "jose";
-import { GoogleGenAI, Modality } from "@google/genai";
+import { createRemoteJWKSet, jwtVerify } from "jose";
+import { GoogleGenAI } from "@google/genai";
 import { z } from "zod";
 import {
   SESSION_LIMITS,
@@ -14,13 +14,15 @@ import {
 
 interface Env {
   USAGE_TRACKER: DurableObjectNamespace;
+  TRANSLATION_SESSION: DurableObjectNamespace;
   SUPABASE_URL: string;
   SUPABASE_JWT_AUDIENCE?: string;
   SUPABASE_JWT_ISSUER?: string;
   GEMINI_API_KEY: string;
+  DEEPGRAM_API_KEY: string;
 }
 
-// ── Durable Object: Per-User Usage Tracking ──
+// ── Durable Object: Usage Tracking ──
 
 interface UsageState {
   tokensIssuedToday: number;
@@ -30,389 +32,403 @@ interface UsageState {
   estimatedActiveMs: number;
 }
 
-const dayKey = (date: Date): string => {
-  return `${date.getUTCFullYear()}-${String(date.getUTCMonth() + 1).padStart(2, "0")}-${String(date.getUTCDate()).padStart(2, "0")}`;
-};
+const dayKey = (d: Date) => `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}-${String(d.getUTCDate()).padStart(2, "0")}`;
+const hourKey = (d: Date) => `${dayKey(d)}-${String(d.getUTCHours()).padStart(2, "0")}`;
 
-const hourKey = (date: Date): string => {
-  return `${dayKey(date)}-${String(date.getUTCHours()).padStart(2, "0")}`;
-};
-
-const defaultUsageState = (): UsageState => {
+const defaultUsage = (): UsageState => {
   const now = new Date();
-  return {
-    tokensIssuedToday: 0,
-    tokensIssuedThisHour: 0,
-    currentDayKey: dayKey(now),
-    currentHourKey: hourKey(now),
-    estimatedActiveMs: 0,
-  };
+  return { tokensIssuedToday: 0, tokensIssuedThisHour: 0, currentDayKey: dayKey(now), currentHourKey: hourKey(now), estimatedActiveMs: 0 };
 };
 
 export class UsageTracker {
   private readonly state: DurableObjectState;
-  private usage: UsageState = defaultUsageState();
+  private usage: UsageState = defaultUsage();
   private initialized = false;
 
-  constructor(state: DurableObjectState) {
-    this.state = state;
-  }
+  constructor(state: DurableObjectState) { this.state = state; }
 
-  private async init(): Promise<void> {
+  private async init() {
     if (this.initialized) return;
-    const stored = await this.state.storage.get<UsageState>("usage");
-    if (stored) {
-      this.usage = stored;
-    }
+    const s = await this.state.storage.get<UsageState>("usage");
+    if (s) this.usage = s;
     this.initialized = true;
   }
 
-  private rotateWindows(now: Date): void {
+  private rotate(now: Date) {
     const dk = dayKey(now);
-    if (this.usage.currentDayKey !== dk) {
-      this.usage.currentDayKey = dk;
-      this.usage.tokensIssuedToday = 0;
-      this.usage.estimatedActiveMs = 0;
-    }
-
+    if (this.usage.currentDayKey !== dk) { this.usage.currentDayKey = dk; this.usage.tokensIssuedToday = 0; this.usage.estimatedActiveMs = 0; }
     const hk = hourKey(now);
-    if (this.usage.currentHourKey !== hk) {
-      this.usage.currentHourKey = hk;
-      this.usage.tokensIssuedThisHour = 0;
-    }
+    if (this.usage.currentHourKey !== hk) { this.usage.currentHourKey = hk; this.usage.tokensIssuedThisHour = 0; }
   }
 
   async fetch(request: Request): Promise<Response> {
     await this.init();
-
     const url = new URL(request.url);
 
     if (url.pathname === "/check-and-increment") {
       const now = new Date();
-      this.rotateWindows(now);
-
-      if (
-        this.usage.tokensIssuedThisHour >=
-        SESSION_LIMITS.maxTokensPerUserPerHour
-      ) {
-        return Response.json(
-          {
-            allowed: false,
-            reason: "rate_limited",
-            retryAfterMs: 60_000,
-          },
-          { status: 429 },
-        );
-      }
-
-      if (this.usage.estimatedActiveMs >= SESSION_LIMITS.dailySessionMs) {
-        return Response.json(
-          {
-            allowed: false,
-            reason: "usage_exhausted",
-          },
-          { status: 429 },
-        );
-      }
-
+      this.rotate(now);
+      if (this.usage.tokensIssuedThisHour >= SESSION_LIMITS.maxTokensPerUserPerHour)
+        return Response.json({ allowed: false, reason: "rate_limited", retryAfterMs: 60_000 }, { status: 429 });
+      if (this.usage.estimatedActiveMs >= SESSION_LIMITS.dailySessionMs)
+        return Response.json({ allowed: false, reason: "usage_exhausted" }, { status: 429 });
       this.usage.tokensIssuedToday += 1;
       this.usage.tokensIssuedThisHour += 1;
-      // Don't pre-charge session time — actual usage is reported via /report-usage
       await this.state.storage.put("usage", this.usage);
-
-      const dailyRemainingMs = Math.max(
-        0,
-        SESSION_LIMITS.dailySessionMs - this.usage.estimatedActiveMs,
-      );
-
-      return Response.json({
-        allowed: true,
-        dailyRemainingMs,
-        tokensGeneratedToday: this.usage.tokensIssuedToday,
-      });
+      return Response.json({ allowed: true, dailyRemainingMs: Math.max(0, SESSION_LIMITS.dailySessionMs - this.usage.estimatedActiveMs), tokensGeneratedToday: this.usage.tokensIssuedToday });
     }
 
     if (url.pathname === "/report-usage") {
-      const body = (await request.json().catch(() => ({}))) as {
-        durationMs?: number;
-      };
-      const durationMs = body.durationMs;
-      if (typeof durationMs === "number" && durationMs > 0) {
-        this.rotateWindows(new Date());
-        this.usage.estimatedActiveMs += durationMs;
+      const body = (await request.json().catch(() => ({}))) as { durationMs?: number };
+      if (typeof body.durationMs === "number" && body.durationMs > 0) {
+        this.rotate(new Date());
+        this.usage.estimatedActiveMs += body.durationMs;
         await this.state.storage.put("usage", this.usage);
       }
-
-      return Response.json({
-        ok: true,
-        estimatedActiveMs: this.usage.estimatedActiveMs,
-        dailyRemainingMs: Math.max(
-          0,
-          SESSION_LIMITS.dailySessionMs - this.usage.estimatedActiveMs,
-        ),
-      });
+      return Response.json({ ok: true, estimatedActiveMs: this.usage.estimatedActiveMs });
     }
 
     if (url.pathname === "/reset") {
-      this.usage = defaultUsageState();
+      this.usage = defaultUsage();
       await this.state.storage.put("usage", this.usage);
-      return Response.json({ ok: true, usage: this.usage });
-    }
-
-    if (url.pathname === "/status") {
-      const now = new Date();
-      this.rotateWindows(now);
-
-      return Response.json({
-        tokensIssuedToday: this.usage.tokensIssuedToday,
-        tokensIssuedThisHour: this.usage.tokensIssuedThisHour,
-        estimatedActiveMs: this.usage.estimatedActiveMs,
-        dailyRemainingMs: Math.max(
-          0,
-          SESSION_LIMITS.dailySessionMs - this.usage.estimatedActiveMs,
-        ),
-      });
+      return Response.json({ ok: true });
     }
 
     return new Response("Not found", { status: 404 });
   }
 }
 
+// ── Durable Object: Translation Session ──
+// Accepts WebSocket from desktop, connects to Deepgram Flux for STT,
+// translates via Gemini Flash, sends results back.
+
+export class TranslationSession {
+  private readonly state: DurableObjectState;
+  private readonly env: Env;
+  private client: WebSocket | null = null;
+  private youDg: WebSocket | null = null;
+  private themDg: WebSocket | null = null;
+  private youTarget = "hi-IN";
+  private themTarget = "en-US";
+  private authenticated = false;
+
+  constructor(state: DurableObjectState, env: Env) {
+    this.state = state;
+    this.env = env;
+  }
+
+  async fetch(request: Request): Promise<Response> {
+    const upgrade = request.headers.get("Upgrade");
+    if (!upgrade || upgrade.toLowerCase() !== "websocket") {
+      return new Response("Expected WebSocket", { status: 426 });
+    }
+
+    const pair = new WebSocketPair();
+    const clientWs = pair[0];
+    const serverWs = pair[1];
+
+    serverWs.accept();
+    this.client = serverWs;
+
+    serverWs.addEventListener("message", (event: MessageEvent) => {
+      void this.handleClientMessage(event);
+    });
+
+    serverWs.addEventListener("close", () => {
+      this.cleanup();
+    });
+
+    return new Response(null, { status: 101, webSocket: clientWs });
+  }
+
+  private async handleClientMessage(event: MessageEvent): Promise<void> {
+    if (typeof event.data !== "string") return;
+
+    let msg: ClientMsg;
+    try { msg = JSON.parse(event.data) as ClientMsg; } catch { return; }
+
+    if (msg.type === "auth") {
+      const claims = await verifySupabaseToken(msg.token, this.env);
+      if (!claims) {
+        this.sendToClient({ type: "error", message: "Authentication failed" });
+        return;
+      }
+      this.authenticated = true;
+      this.sendToClient({ type: "auth_ok" });
+      return;
+    }
+
+    if (!this.authenticated) {
+      this.sendToClient({ type: "error", message: "Not authenticated" });
+      return;
+    }
+
+    if (msg.type === "config") {
+      if (msg.youTarget) this.youTarget = msg.youTarget;
+      if (msg.themTarget) this.themTarget = msg.themTarget;
+      this.sendToClient({ type: "config_ok" });
+      return;
+    }
+
+    if (msg.type === "start") {
+      this.startDeepgram("you");
+      this.startDeepgram("them");
+      return;
+    }
+
+    if (msg.type === "audio") {
+      const buf = base64ToArrayBuffer(msg.data);
+      if (msg.speaker === "you" && this.youDg?.readyState === WebSocket.OPEN) {
+        this.youDg.send(buf);
+      } else if (msg.speaker === "them" && this.themDg?.readyState === WebSocket.OPEN) {
+        this.themDg.send(buf);
+      }
+      return;
+    }
+
+    if (msg.type === "stop") {
+      this.cleanup();
+      return;
+    }
+  }
+
+  private startDeepgram(speaker: "you" | "them"): void {
+    const key = this.env.DEEPGRAM_API_KEY;
+    const url = `wss://api.deepgram.com/v1/listen?model=nova-3&language=multi&encoding=linear16&sample_rate=16000&punctuate=true&interim_results=true&utterance_end_ms=3000&smart_format=true`;
+
+    const ws = new WebSocket(url, ["token", key]);
+
+    ws.addEventListener("open", () => {
+      console.log(`[TranslationSession] Deepgram ${speaker} connected`);
+      this.sendToClient({ type: "stt_connected", speaker });
+    });
+
+    ws.addEventListener("message", (event: MessageEvent) => {
+      void this.handleDeepgramMessage(speaker, event);
+    });
+
+    ws.addEventListener("close", () => {
+      console.log(`[TranslationSession] Deepgram ${speaker} closed`);
+    });
+
+    ws.addEventListener("error", () => {
+      console.error(`[TranslationSession] Deepgram ${speaker} error`);
+    });
+
+    if (speaker === "you") this.youDg = ws;
+    else this.themDg = ws;
+  }
+
+  private async handleDeepgramMessage(speaker: "you" | "them", event: MessageEvent): Promise<void> {
+    let msg: DeepgramMsg;
+    try {
+      const text = typeof event.data === "string" ? event.data : new TextDecoder().decode(event.data as ArrayBuffer);
+      msg = JSON.parse(text) as DeepgramMsg;
+    } catch { return; }
+
+    // v2 Flux: EndOfTurn / EagerEndOfTurn
+    if (msg.type === "EndOfTurn" || msg.type === "EagerEndOfTurn") {
+      this.sendToClient({ type: "end_of_turn", speaker });
+      return;
+    }
+
+    // v1: UtteranceEnd (similar to EndOfTurn)
+    if (msg.type === "UtteranceEnd") {
+      this.sendToClient({ type: "end_of_turn", speaker });
+      return;
+    }
+
+    // Transcript (both v1 and v2)
+    const alt = msg.channel?.alternatives?.[0];
+    if (!alt?.transcript?.trim()) return;
+
+    const transcript = alt.transcript.trim();
+
+    if (!msg.is_final) {
+      this.sendToClient({ type: "partial", speaker, text: transcript });
+      return;
+    }
+
+    // Final sentence — send immediately, then translate
+    this.sendToClient({ type: "sentence", speaker, text: transcript, translation: null });
+
+    const targetLang = speaker === "you" ? this.youTarget : this.themTarget;
+    const translation = await this.translate(transcript, targetLang);
+
+    this.sendToClient({ type: "sentence", speaker, text: transcript, translation });
+  }
+
+  private async translate(text: string, targetLang: string): Promise<string> {
+    try {
+      const client = new GoogleGenAI({ apiKey: this.env.GEMINI_API_KEY });
+      const result = await client.models.generateContent({
+        model: "gemini-2.5-flash",
+        contents: [{ role: "user", parts: [{ text: `Translate to ${targetLang}. Output ONLY the translation, nothing else.\n\n${text}` }] }],
+        config: { temperature: 0, maxOutputTokens: 256 },
+      });
+      return result.text ?? "";
+    } catch (err) {
+      console.error("[TranslationSession] Translation error:", err);
+      return "";
+    }
+  }
+
+  private sendToClient(msg: ServerMsg): void {
+    if (this.client?.readyState === WebSocket.OPEN) {
+      this.client.send(JSON.stringify(msg));
+    }
+  }
+
+  private cleanup(): void {
+    if (this.youDg) { try { this.youDg.close(); } catch { /* */ } this.youDg = null; }
+    if (this.themDg) { try { this.themDg.close(); } catch { /* */ } this.themDg = null; }
+    this.authenticated = false;
+  }
+}
+
+type ClientMsg =
+  | { type: "auth"; token: string }
+  | { type: "config"; youTarget?: string; themTarget?: string }
+  | { type: "start" }
+  | { type: "audio"; speaker: "you" | "them"; data: string }
+  | { type: "stop" };
+
+type ServerMsg =
+  | { type: "auth_ok" }
+  | { type: "config_ok" }
+  | { type: "stt_connected"; speaker: "you" | "them" }
+  | { type: "partial"; speaker: "you" | "them"; text: string }
+  | { type: "sentence"; speaker: "you" | "them"; text: string; translation: string | null }
+  | { type: "end_of_turn"; speaker: "you" | "them" }
+  | { type: "error"; message: string };
+
+interface DeepgramMsg {
+  type?: string;
+  is_final?: boolean;
+  channel?: { alternatives?: Array<{ transcript?: string; confidence?: number }> };
+}
+
+function base64ToArrayBuffer(b64: string): ArrayBuffer {
+  const bin = atob(b64);
+  const buf = new ArrayBuffer(bin.length);
+  const view = new Uint8Array(buf);
+  for (let i = 0; i < bin.length; i++) view[i] = bin.charCodeAt(i);
+  return buf;
+}
+
 // ── JWT Verification ──
 
 let cachedJWKS: ReturnType<typeof createRemoteJWKSet> | null = null;
-
-const getJWKS = (env: Env): ReturnType<typeof createRemoteJWKSet> => {
-  if (!cachedJWKS) {
-    cachedJWKS = createRemoteJWKSet(
-      new URL(`${env.SUPABASE_URL}/auth/v1/.well-known/jwks.json`),
-    );
-  }
+const getJWKS = (env: Env) => {
+  if (!cachedJWKS) cachedJWKS = createRemoteJWKSet(new URL(`${env.SUPABASE_URL}/auth/v1/.well-known/jwks.json`));
   return cachedJWKS;
 };
 
-const verifySupabaseToken = async (
-  token: string,
-  env: Env,
-): Promise<{ sub: string } | null> => {
+const verifySupabaseToken = async (token: string, env: Env): Promise<{ sub: string } | null> => {
   try {
-    const issuer =
-      env.SUPABASE_JWT_ISSUER || `${env.SUPABASE_URL}/auth/v1`;
+    const issuer = env.SUPABASE_JWT_ISSUER || `${env.SUPABASE_URL}/auth/v1`;
     const audience = env.SUPABASE_JWT_AUDIENCE || "authenticated";
-
-    const { payload } = await jwtVerify(token, getJWKS(env), {
-      issuer,
-      audience,
-    });
-
-    if (typeof payload.sub !== "string") return null;
-    return { sub: payload.sub };
-  } catch {
-    return null;
-  }
+    const { payload } = await jwtVerify(token, getJWKS(env), { issuer, audience });
+    return typeof payload.sub === "string" ? { sub: payload.sub } : null;
+  } catch { return null; }
 };
-
-// ── Gemini Ephemeral Token Generation ──
-
-const generateEphemeralToken = async (
-  apiKey: string,
-  model: string,
-): Promise<{ token: string; expiresAt: string } | null> => {
-  const expireTime = new Date(
-    Date.now() + SESSION_LIMITS.tokenLifetimeMs,
-  ).toISOString();
-
-  try {
-    const client = new GoogleGenAI({ apiKey });
-
-    const token = await client.authTokens.create({
-      config: {
-        uses: 10,
-        expireTime,
-        newSessionExpireTime: new Date(
-          Date.now() + 2 * 60 * 1000,
-        ).toISOString(),
-        httpOptions: {
-          apiVersion: "v1alpha",
-        },
-      },
-    });
-
-    const tokenName = token?.name;
-    if (!tokenName) {
-      console.error(
-        "Ephemeral token response missing name:",
-        JSON.stringify(token),
-      );
-      return null;
-    }
-
-    return {
-      token: tokenName,
-      expiresAt: (token as { expireTime?: string }).expireTime ?? expireTime,
-    };
-  } catch (err) {
-    console.error(
-      "Ephemeral token generation failed:",
-      err instanceof Error ? err.message : err,
-    );
-    return null;
-  }
-};
-
-// ── Request Validation ──
-
-const tokenRequestSchema = z.object({
-  model: z.string().optional(),
-});
 
 // ── Hono App ──
 
 const app = new Hono<{ Bindings: Env }>();
-
 app.use("*", cors());
 
-app.get("/health", (c) => {
-  return c.json({ ok: true, service: "realtime-translate-token-service" });
+app.get("/health", (c) => c.json({ ok: true, service: "realtime-translate" }));
+
+// WebSocket endpoint — routes to TranslationSession DO
+app.get("/ws", async (c) => {
+  const upgrade = c.req.header("Upgrade");
+  if (!upgrade || upgrade.toLowerCase() !== "websocket") {
+    return new Response("Expected WebSocket", { status: 426 });
+  }
+
+  const id = c.env.TRANSLATION_SESSION.idFromName("session");
+  const stub = c.env.TRANSLATION_SESSION.get(id);
+  return stub.fetch(c.req.raw);
 });
 
-app.post("/api/report-usage", async (c) => {
+// Token endpoint (kept for ephemeral token generation if needed)
+const tokenRequestSchema = z.object({ model: z.string().optional() });
+
+app.post("/api/token", async (c) => {
   const authHeader = c.req.header("Authorization");
-  if (!authHeader?.startsWith("Bearer ")) {
+  if (!authHeader?.startsWith("Bearer "))
     return c.json({ code: "unauthorized", message: "Missing Authorization" } satisfies TokenError, 401);
-  }
 
   const claims = await verifySupabaseToken(authHeader.slice(7), c.env);
-  if (!claims) {
+  if (!claims)
     return c.json({ code: "unauthorized", message: "Token verification failed" } satisfies TokenError, 401);
+
+  const doId = c.env.USAGE_TRACKER.idFromName(claims.sub);
+  const stub = c.env.USAGE_TRACKER.get(doId);
+  const usageRes = await stub.fetch(new Request("https://do/check-and-increment", { method: "POST" }));
+
+  if (!usageRes.ok) {
+    const d = (await usageRes.json()) as { reason: string; retryAfterMs?: number };
+    if (d.reason === "rate_limited")
+      return c.json({ code: "rate_limited", message: "Too many requests", retryAfterMs: d.retryAfterMs } satisfies TokenError, 429);
+    return c.json({ code: "usage_exhausted", message: "Daily limit reached" } satisfies TokenError, 429);
   }
 
+  return c.json((await usageRes.json()) as TokenResponse);
+});
+
+// Simple translate endpoint
+const translateSchema = z.object({ text: z.string().min(1), targetLang: z.string().min(2) });
+
+app.post("/api/translate", async (c) => {
+  const authHeader = c.req.header("Authorization");
+  if (!authHeader?.startsWith("Bearer "))
+    return c.json({ code: "unauthorized", message: "Missing Authorization" } satisfies TokenError, 401);
+  const claims = await verifySupabaseToken(authHeader.slice(7), c.env);
+  if (!claims)
+    return c.json({ code: "unauthorized", message: "Token verification failed" } satisfies TokenError, 401);
+
+  const body = await c.req.json().catch(() => ({}));
+  const parsed = translateSchema.safeParse(body);
+  if (!parsed.success)
+    return c.json({ code: "invalid_request", message: "Invalid request" } satisfies TokenError, 400);
+
+  try {
+    const client = new GoogleGenAI({ apiKey: c.env.GEMINI_API_KEY });
+    const result = await client.models.generateContent({
+      model: "gemini-2.5-flash",
+      contents: [{ role: "user", parts: [{ text: `Translate to ${parsed.data.targetLang}. Output ONLY the translation, nothing else.\n\n${parsed.data.text}` }] }],
+      config: { temperature: 0, maxOutputTokens: 256 },
+    });
+    return c.json({ text: result.text ?? "" });
+  } catch (err) {
+    return c.json({ code: "token_generation_failed", message: err instanceof Error ? err.message : "Failed" } satisfies TokenError, 500);
+  }
+});
+
+// Usage endpoints
+app.post("/api/report-usage", async (c) => {
+  const authHeader = c.req.header("Authorization");
+  if (!authHeader?.startsWith("Bearer ")) return c.json({ code: "unauthorized", message: "Missing Authorization" } satisfies TokenError, 401);
+  const claims = await verifySupabaseToken(authHeader.slice(7), c.env);
+  if (!claims) return c.json({ code: "unauthorized", message: "Token verification failed" } satisfies TokenError, 401);
   const body = await c.req.json().catch(() => ({}));
   const doId = c.env.USAGE_TRACKER.idFromName(claims.sub);
   const stub = c.env.USAGE_TRACKER.get(doId);
-  const res = await stub.fetch(
-    new Request("https://do/report-usage", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    }),
-  );
+  const res = await stub.fetch(new Request("https://do/report-usage", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }));
   return c.json(await res.json());
 });
 
 app.post("/api/reset-usage", async (c) => {
   const authHeader = c.req.header("Authorization");
-  if (!authHeader?.startsWith("Bearer ")) {
-    return c.json({ code: "unauthorized", message: "Missing Authorization" } satisfies TokenError, 401);
-  }
-
+  if (!authHeader?.startsWith("Bearer ")) return c.json({ code: "unauthorized", message: "Missing Authorization" } satisfies TokenError, 401);
   const claims = await verifySupabaseToken(authHeader.slice(7), c.env);
-  if (!claims) {
-    return c.json({ code: "unauthorized", message: "Token verification failed" } satisfies TokenError, 401);
-  }
-
+  if (!claims) return c.json({ code: "unauthorized", message: "Token verification failed" } satisfies TokenError, 401);
   const doId = c.env.USAGE_TRACKER.idFromName(claims.sub);
   const stub = c.env.USAGE_TRACKER.get(doId);
   const res = await stub.fetch(new Request("https://do/reset", { method: "POST" }));
   return c.json(await res.json());
-});
-
-app.post("/api/token", async (c) => {
-  // Extract and verify Supabase JWT
-  const authHeader = c.req.header("Authorization");
-  if (!authHeader?.startsWith("Bearer ")) {
-    return c.json(
-      {
-        code: "unauthorized",
-        message: "Missing or invalid Authorization header",
-      } satisfies TokenError,
-      401,
-    );
-  }
-
-  const jwt = authHeader.slice(7);
-  const claims = await verifySupabaseToken(jwt, c.env);
-  if (!claims) {
-    return c.json(
-      {
-        code: "unauthorized",
-        message: "Token verification failed",
-      } satisfies TokenError,
-      401,
-    );
-  }
-
-  // Parse request body
-  const body = await c.req.json().catch(() => ({}));
-  const parsed = tokenRequestSchema.safeParse(body);
-  if (!parsed.success) {
-    return c.json(
-      {
-        code: "invalid_request",
-        message: "Invalid request body",
-      } satisfies TokenError,
-      400,
-    );
-  }
-
-  const model = parsed.data.model ?? GEMINI_MODELS.live;
-
-  // Check usage limits via Durable Object
-  const doId = c.env.USAGE_TRACKER.idFromName(claims.sub);
-  const stub = c.env.USAGE_TRACKER.get(doId);
-  const usageResponse = await stub.fetch(
-    new Request("https://do/check-and-increment", { method: "POST" }),
-  );
-
-  if (!usageResponse.ok) {
-    const usageData = (await usageResponse.json()) as {
-      reason: string;
-      retryAfterMs?: number;
-    };
-
-    if (usageData.reason === "rate_limited") {
-      return c.json(
-        {
-          code: "rate_limited",
-          message: "Too many token requests. Please wait before trying again.",
-          retryAfterMs: usageData.retryAfterMs,
-        } satisfies TokenError,
-        429,
-      );
-    }
-
-    return c.json(
-      {
-        code: "usage_exhausted",
-        message: "Daily usage limit reached. Resets at midnight UTC.",
-      } satisfies TokenError,
-      429,
-    );
-  }
-
-  const usageData = (await usageResponse.json()) as {
-    dailyRemainingMs: number;
-    tokensGeneratedToday: number;
-  };
-
-  // Generate Gemini ephemeral token
-  const ephemeral = await generateEphemeralToken(c.env.GEMINI_API_KEY, model);
-  if (!ephemeral) {
-    return c.json(
-      {
-        code: "token_generation_failed",
-        message: "Failed to generate Gemini ephemeral token",
-      } satisfies TokenError,
-      502,
-    );
-  }
-
-  return c.json({
-    token: ephemeral.token,
-    expiresAt: ephemeral.expiresAt,
-    dailyRemainingMs: usageData.dailyRemainingMs,
-    tokensGeneratedToday: usageData.tokensGeneratedToday,
-  } satisfies TokenResponse);
 });
 
 export default {

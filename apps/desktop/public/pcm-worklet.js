@@ -2,14 +2,14 @@
  * AudioWorklet processor that captures audio, downsamples to 16kHz,
  * and converts to 16-bit PCM for Gemini Live API.
  *
- * Must be loaded via: audioContext.audioWorklet.addModule('pcm-worklet.js')
+ * Buffers to ~20ms chunks (320 samples at 16kHz = 640 bytes).
  */
 class PcmCaptureProcessor extends AudioWorkletProcessor {
   constructor() {
     super();
     this._buffer = new Float32Array(0);
-    // Accumulate samples until we have ~25ms worth at 16kHz = 400 samples
-    this._chunkSize = 400;
+    // 20ms at 16kHz = 320 samples — sweet spot for Gemini (docs say 20-40ms)
+    this._chunkSize = 320;
   }
 
   process(inputs) {
@@ -18,10 +18,7 @@ class PcmCaptureProcessor extends AudioWorkletProcessor {
       return true;
     }
 
-    // Take first channel (mono)
     const channelData = input[0];
-
-    // Downsample from native rate (usually 48kHz) to 16kHz
     const ratio = sampleRate / 16000;
     const outputLength = Math.floor(channelData.length / ratio);
     const downsampled = new Float32Array(outputLength);
@@ -40,12 +37,11 @@ class PcmCaptureProcessor extends AudioWorkletProcessor {
     newBuffer.set(downsampled, this._buffer.length);
     this._buffer = newBuffer;
 
-    // Emit chunks when buffer is large enough
+    // Emit 20ms chunks
     while (this._buffer.length >= this._chunkSize) {
       const chunk = this._buffer.slice(0, this._chunkSize);
       this._buffer = this._buffer.slice(this._chunkSize);
 
-      // Convert Float32 to Int16 PCM
       const pcm = new Int16Array(chunk.length);
       for (let i = 0; i < chunk.length; i++) {
         const clamped = Math.max(-1, Math.min(1, chunk[i]));

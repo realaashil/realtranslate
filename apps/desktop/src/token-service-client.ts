@@ -83,6 +83,27 @@ export class TokenServiceClient {
     throw lastError ?? new Error("Token request failed after retries");
   }
 
+  async translate(
+    supabaseAccessToken: string,
+    text: string,
+    targetLang: string,
+  ): Promise<string> {
+    const url = `${this.config.serviceUrl}/api/translate`;
+    const response = await fetch(url, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${supabaseAccessToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ text, targetLang }),
+    });
+
+    if (!response.ok) return "";
+
+    const data = (await response.json()) as { text?: string };
+    return data.text ?? "";
+  }
+
   async reportUsage(
     supabaseAccessToken: string,
     durationMs: number,

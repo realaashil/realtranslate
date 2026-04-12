@@ -266,6 +266,128 @@ const startMicCapture = async (): Promise<void> => {
   }
 };
 
+// ── Feed: in-place DOM updates for streaming ──
+
+const feedElements = new Map<string, {
+  wrap: HTMLElement;
+  translatedP: HTMLElement | null;
+  originalP: HTMLElement | null;
+  statusIcon: HTMLElement | null;
+  lastStatus: UtteranceStatus;
+  lastOriginal: string;
+  lastTranslated: string;
+}>();
+
+const updateFeed = (utterances: PipelineUtterance[], isSignedIn: boolean): void => {
+  const recent = utterances.slice(-12);
+  const recentIds = new Set(recent.map((u) => u.id));
+
+  // Remove DOM nodes for utterances no longer in the list
+  for (const [id, entry] of feedElements) {
+    if (!recentIds.has(id)) {
+      entry.wrap.remove();
+      feedElements.delete(id);
+    }
+  }
+
+  // Show empty state
+  if (recent.length === 0) {
+    if (!feedSection.querySelector(".empty-state")) {
+      feedSection.replaceChildren();
+      feedSection.append(
+        el("div", { class: "empty-state" },
+          el("p", {}, isSignedIn ? "Press Go Live to start translating." : "Sign in to begin.")),
+      );
+    }
+    return;
+  }
+
+  // Remove empty state if present
+  const emptyEl = feedSection.querySelector(".empty-state");
+  if (emptyEl) emptyEl.remove();
+
+  for (const u of recent) {
+    const existing = feedElements.get(u.id);
+
+    if (!existing) {
+      // New utterance — create DOM
+      const wrap = createUtteranceEl(u);
+      wrap.setAttribute("data-id", u.id);
+      feedSection.append(wrap);
+      feedElements.set(u.id, {
+        wrap,
+        translatedP: wrap.querySelector(".utterance-translated"),
+        originalP: wrap.querySelector(".utterance-original"),
+        statusIcon: wrap.querySelector(".utterance-status-icon"),
+        lastStatus: u.status,
+        lastOriginal: u.originalText,
+        lastTranslated: u.translatedText,
+      });
+    } else {
+      // Existing utterance — patch text in-place (no DOM rebuild)
+      if (u.translatedText !== existing.lastTranslated) {
+        if (existing.translatedP) {
+          existing.translatedP.textContent = u.translatedText || "...";
+        } else if (u.translatedText) {
+          const p = el("p", { class: "utterance-translated" }, u.translatedText);
+          // Insert before original text
+          const origP = existing.wrap.querySelector(".utterance-original");
+          if (origP) {
+            existing.wrap.insertBefore(p, origP);
+          } else {
+            const meta = existing.wrap.querySelector(".utterance-meta");
+            if (meta) existing.wrap.insertBefore(p, meta);
+            else existing.wrap.append(p);
+          }
+          existing.translatedP = p;
+        }
+        existing.lastTranslated = u.translatedText;
+      }
+
+      if (u.originalText !== existing.lastOriginal) {
+        if (existing.originalP) {
+          existing.originalP.textContent = u.originalText;
+        } else if (u.originalText) {
+          const p = el("p", { class: "utterance-original" }, u.originalText);
+          const meta = existing.wrap.querySelector(".utterance-meta");
+          if (meta) existing.wrap.insertBefore(p, meta);
+          else existing.wrap.append(p);
+          existing.originalP = p;
+        }
+        existing.lastOriginal = u.originalText;
+      }
+
+      // Update status icon + styling if changed
+      if (u.status !== existing.lastStatus) {
+        existing.wrap.className = `utterance ${u.speaker}`;
+
+        if (existing.lastStatus === "listening" && u.status !== "listening") {
+          const dots = existing.wrap.querySelector(".listening-dots");
+          if (dots) dots.remove();
+        }
+
+        // Update the status icon
+        if (existing.statusIcon) {
+          if (u.status === "done") {
+            existing.statusIcon.className = "utterance-status-icon done";
+            existing.statusIcon.textContent = "\u2713";
+          } else if (u.status === "processing") {
+            existing.statusIcon.className = "utterance-status-icon processing";
+            existing.statusIcon.textContent = "\u25CB";
+          } else {
+            existing.statusIcon.className = "utterance-status-icon";
+            existing.statusIcon.textContent = "";
+          }
+        }
+
+        existing.lastStatus = u.status;
+      }
+    }
+  }
+
+  feedSection.scrollTop = feedSection.scrollHeight;
+};
+
 // ── System Audio Capture (macOS/Windows via desktopCapturer) ──
 
 const stopSystemAudioCapture = (): void => {
@@ -462,21 +584,8 @@ const renderSnapshot = (snap: PipelineSnapshot): void => {
   errorPill.textContent = snap.error ?? "";
   errorPill.style.display = snap.error ? "" : "none";
 
-  // Feed
-  feedSection.replaceChildren();
-  if (snap.utterances.length === 0) {
-    const empty = el("div", { class: "empty-state" },
-      el("p", {}, snap.auth.status === "signed_in"
-        ? "Press Go Live to start translating."
-        : "Sign in to begin."),
-    );
-    feedSection.append(empty);
-  } else {
-    for (const u of snap.utterances.slice(-12)) {
-      feedSection.append(createUtteranceEl(u));
-    }
-    feedSection.scrollTop = feedSection.scrollHeight;
-  }
+  // Feed — update in-place for streaming performance
+  updateFeed(snap.utterances, snap.auth.status === "signed_in");
 
   // Bottom nav
   updateBottomNav(snap.utterances, snap.isRunning);

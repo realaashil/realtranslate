@@ -23,8 +23,8 @@ import {
   GeminiSessionManager,
   type LanguageSettings as GeminiLanguageSettings,
   type SessionManagerSnapshot,
+  type SessionState,
 } from "./gemini-session-manager";
-import type { SessionState } from "./gemini-live-session";
 import {
   startSystemAudioCapture,
   getDesktopSourceId,
@@ -200,8 +200,11 @@ const supabase = createClient(supabaseUrl, supabasePublishableKey, {
 
 // ── Gemini Session Manager ──
 
+const deepgramApiKey = process.env.DEEPGRAM_API_KEY ?? "";
+
 const sessionManager = new GeminiSessionManager({
   tokenServiceUrl: appSettings.tokenServiceUrl,
+  deepgramApiKey,
   language: appSettings.language as GeminiLanguageSettings,
 });
 

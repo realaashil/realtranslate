@@ -8,24 +8,6 @@ export interface SystemAudioCapture {
   stop: () => void;
 }
 
-// ── Shared: PCM chunking helper ──
-
-function createPcmChunker(onChunk: SystemAudioCallback): (data: Buffer) => void {
-  const chunkBytes = Math.floor(
-    (AUDIO_CONFIG.sampleRate * AUDIO_CONFIG.chunkDurationMs * 2) / 1000,
-  );
-  let buffer = Buffer.alloc(0);
-
-  return (data: Buffer) => {
-    buffer = Buffer.concat([buffer, data]);
-    while (buffer.length >= chunkBytes) {
-      const chunk = buffer.subarray(0, chunkBytes);
-      buffer = buffer.subarray(chunkBytes);
-      onChunk(chunk.toString("base64"));
-    }
-  };
-}
-
 // ── Linux: PulseAudio/PipeWire via parec ──
 
 function getLinuxMonitorSource(): string | null {
@@ -63,7 +45,7 @@ function startLinuxCapture(
     "--format=s16le",
     `--rate=${AUDIO_CONFIG.sampleRate}`,
     "--channels=1",
-    "--latency-msec=25",
+    "--latency-msec=10",
   ]);
 
   if (!proc.stdout) {
@@ -73,9 +55,11 @@ function startLinuxCapture(
   }
 
   console.log(`[SystemAudio] parec started (pid ${proc.pid})`);
-  const pushChunk = createPcmChunker(onChunk);
 
-  proc.stdout.on("data", pushChunk);
+  // Send data as it arrives — no extra buffering delay
+  proc.stdout.on("data", (data: Buffer) => {
+    onChunk(data.toString("base64"));
+  });
 
   proc.stderr?.on("data", (data: Buffer) => {
     const msg = data.toString().trim();

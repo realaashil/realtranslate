@@ -1,21 +1,14 @@
+import WebSocket from "ws";
 import {
   SESSION_LIMITS,
-  GEMINI_MODELS,
   type SupportedLanguage,
   type Speaker,
   type Utterance,
   type UtteranceStatus,
   ConversationQueue,
 } from "@realtime/shared";
-import {
-  GeminiLiveSession,
-  type GeminiLiveSessionConfig,
-  type SessionState,
-} from "./gemini-live-session";
-import {
-  TokenServiceClient,
-  TokenServiceError,
-} from "./token-service-client";
+
+export type SessionState = "disconnected" | "connecting" | "ready" | "error";
 
 export interface LanguageSettings {
   youSource: SupportedLanguage;
@@ -26,6 +19,7 @@ export interface LanguageSettings {
 
 export interface GeminiSessionManagerConfig {
   tokenServiceUrl: string;
+  deepgramApiKey?: string;
   language: LanguageSettings;
 }
 
@@ -40,327 +34,332 @@ export interface SessionManagerSnapshot {
 
 type SessionManagerListener = (snapshot: SessionManagerSnapshot) => void;
 
+type ServerMsg =
+  | { type: "auth_ok" }
+  | { type: "config_ok" }
+  | { type: "stt_connected"; speaker: Speaker }
+  | { type: "partial"; speaker: Speaker; text: string }
+  | { type: "sentence"; speaker: Speaker; text: string; translation: string | null }
+  | { type: "end_of_turn"; speaker: Speaker }
+  | { type: "error"; message: string };
+
+// Track each sentence by index, not by text matching
+interface SpeakerState {
+  utteranceId: string | null;
+  sentences: string[];
+  translations: (string | null)[];  // null = pending translation
+  partial: string;
+  pendingEnd: boolean;
+  pendingTranslations: number;  // count of sentences awaiting translation
+}
+
+const emptySpeakerState = (): SpeakerState => ({
+  utteranceId: null,
+  sentences: [],
+  translations: [],
+  partial: "",
+  pendingEnd: false,
+  pendingTranslations: 0,
+});
+
 export class GeminiSessionManager {
   private config: GeminiSessionManagerConfig;
-  private tokenClient: TokenServiceClient;
-  private youSession: GeminiLiveSession | null = null;
-  private themSession: GeminiLiveSession | null = null;
+  private ws: WebSocket | null = null;
   private queue = new ConversationQueue();
   private isRunning = false;
+  private youState: SessionState = "disconnected";
+  private themState: SessionState = "disconnected";
   private dailyRemainingMs: number | null = null;
   private lastError: string | null = null;
   private listeners: SessionManagerListener[] = [];
-  private tokenRefreshTimers: NodeJS.Timeout[] = [];
-  private currentYouUtteranceId: string | null = null;
-  private currentThemUtteranceId: string | null = null;
   private accessToken: string | null = null;
   private sessionStartedAt: number | null = null;
+  private you: SpeakerState = emptySpeakerState();
+  private them: SpeakerState = emptySpeakerState();
 
-  constructor(config: GeminiSessionManagerConfig) {
-    this.config = config;
-    this.tokenClient = new TokenServiceClient({
-      serviceUrl: config.tokenServiceUrl,
-    });
-  }
+  constructor(config: GeminiSessionManagerConfig) { this.config = config; }
+
+  private sp(speaker: Speaker): SpeakerState { return speaker === "you" ? this.you : this.them; }
 
   onSnapshot(listener: SessionManagerListener): () => void {
     this.listeners.push(listener);
-    return () => {
-      this.listeners = this.listeners.filter((l) => l !== listener);
-    };
+    return () => { this.listeners = this.listeners.filter((l) => l !== listener); };
   }
 
   private emitSnapshot(): void {
-    const snapshot = this.getSnapshot();
-    for (const listener of this.listeners) {
-      listener(snapshot);
-    }
+    const snap = this.getSnapshot();
+    for (const l of this.listeners) l(snap);
   }
 
   getSnapshot(): SessionManagerSnapshot {
     return {
       isRunning: this.isRunning,
-      youSessionState: this.youSession?.state ?? "disconnected",
-      themSessionState: this.themSession?.state ?? "disconnected",
+      youSessionState: this.youState,
+      themSessionState: this.themState,
       utterances: this.queue.getOrdered(),
       dailyRemainingMs: this.dailyRemainingMs,
       error: this.lastError,
     };
   }
 
-  setAccessToken(token: string | null): void {
-    this.accessToken = token;
-  }
+  setAccessToken(token: string | null): void { this.accessToken = token; }
 
   updateConfig(config: Partial<GeminiSessionManagerConfig>): void {
-    if (config.tokenServiceUrl) {
-      this.config.tokenServiceUrl = config.tokenServiceUrl;
-      this.tokenClient.updateConfig({ serviceUrl: config.tokenServiceUrl });
-    }
-    if (config.language) {
-      this.config.language = config.language;
-    }
+    if (config.tokenServiceUrl) this.config.tokenServiceUrl = config.tokenServiceUrl;
+    if (config.language) this.config.language = config.language;
   }
 
   async startSessions(): Promise<void> {
     if (this.isRunning) return;
-    if (!this.accessToken) {
-      this.lastError = "Not authenticated";
-      this.emitSnapshot();
-      return;
-    }
+    if (!this.accessToken) { this.lastError = "Not authenticated"; this.emitSnapshot(); return; }
 
     this.isRunning = true;
     this.lastError = null;
     this.queue.clear();
     this.sessionStartedAt = Date.now();
+    this.you = emptySpeakerState();
+    this.them = emptySpeakerState();
     this.emitSnapshot();
+    this.connectWebSocket();
+  }
 
-    try {
-      await Promise.all([
-        this.startSession("you"),
-        this.startSession("them"),
-      ]);
-    } catch (err) {
-      this.lastError =
-        err instanceof Error ? err.message : "Failed to start sessions";
+  private connectWebSocket(): void {
+    const wsUrl = this.config.tokenServiceUrl.replace(/^http/, "ws") + "/ws";
+    this.ws = new WebSocket(wsUrl);
+
+    this.ws.on("open", () => {
+      console.log("[SM] WS connected");
+      this.send({ type: "auth", token: this.accessToken! });
+    });
+
+    this.ws.on("message", (data: WebSocket.Data) => {
+      const text = typeof data === "string" ? data : Buffer.from(data as Buffer).toString();
+      let msg: ServerMsg;
+      try { msg = JSON.parse(text) as ServerMsg; } catch { return; }
+      this.handleServerMessage(msg);
+    });
+
+    this.ws.on("error", (err: Error) => {
+      console.error("[SM] WS error:", err.message);
+      this.lastError = err.message;
       this.emitSnapshot();
+    });
+
+    this.ws.on("close", () => {
+      console.log("[SM] WS closed");
+      this.youState = "disconnected";
+      this.themState = "disconnected";
+      this.emitSnapshot();
+    });
+  }
+
+  private handleServerMessage(msg: ServerMsg): void {
+    if (msg.type === "auth_ok") {
+      this.send({
+        type: "config",
+        youTarget: this.config.language.youTarget,
+        themTarget: this.config.language.themTarget,
+      });
+      this.send({ type: "start" });
+      return;
+    }
+
+    if (msg.type === "config_ok") return;
+
+    if (msg.type === "stt_connected") {
+      if (msg.speaker === "you") this.youState = "ready";
+      else this.themState = "ready";
+      this.emitSnapshot();
+      return;
+    }
+
+    if (msg.type === "error") {
+      this.lastError = msg.message;
+      this.emitSnapshot();
+      return;
+    }
+
+    if (msg.type === "partial") {
+      this.handlePartial(msg.speaker, msg.text);
+      return;
+    }
+
+    if (msg.type === "sentence") {
+      this.handleSentence(msg.speaker, msg.text, msg.translation);
+      return;
+    }
+
+    if (msg.type === "end_of_turn") {
+      this.handleEndOfTurn(msg.speaker);
+      return;
     }
   }
 
-  private async startSession(speaker: Speaker): Promise<void> {
-    if (!this.accessToken) return;
+  // ── Partial: speech in progress ──
 
-    const token = await this.acquireToken();
-    if (!token) return;
+  private handlePartial(speaker: Speaker, text: string): void {
+    const s = this.sp(speaker);
 
-    const sourceLang =
-      speaker === "you"
-        ? this.config.language.youSource
-        : this.config.language.themSource;
-    const targetLang =
-      speaker === "you"
-        ? this.config.language.youTarget
-        : this.config.language.themTarget;
+    // New speech arrived — cancel any pending finalization
+    s.pendingEnd = false;
+    s.partial = text;
 
-    const sessionConfig: GeminiLiveSessionConfig = {
-      token: token.token,
-      sourceLang,
-      targetLang,
-      label: speaker,
-    };
+    const utteranceId = this.ensureUtterance(speaker);
+    if (!utteranceId) return;
 
-    const session = new GeminiLiveSession(sessionConfig);
-    this.wireSessionEvents(session, speaker);
+    const fullOriginal = [...s.sentences, text].filter(Boolean).join(" ");
+    const fullTranslated = s.translations.filter(Boolean).join(" ");
 
-    if (speaker === "you") {
-      this.youSession = session;
+    this.queue.upsert(utteranceId, {
+      status: "processing" as UtteranceStatus,
+      originalText: fullOriginal,
+      translatedText: fullTranslated || undefined,
+    });
+    this.emitSnapshot();
+  }
+
+  // ── Sentence: final transcript (with or without translation) ──
+
+  private handleSentence(speaker: Speaker, text: string, translation: string | null): void {
+    const s = this.sp(speaker);
+
+    if (translation === null) {
+      // New sentence detected, translation pending
+      // Cancel pending finalization — more content coming
+      s.pendingEnd = false;
+      s.partial = "";
+      s.sentences.push(text);
+      s.translations.push(null);
+      s.pendingTranslations++;
+
+      const utteranceId = this.ensureUtterance(speaker);
+      if (!utteranceId) return;
+
+      this.queue.upsert(utteranceId, {
+        status: "processing" as UtteranceStatus,
+        originalText: s.sentences.join(" "),
+        translatedText: s.translations.filter(Boolean).join(" ") || undefined,
+      });
+      this.emitSnapshot();
     } else {
-      this.themSession = session;
+      // Translation arrived for an existing sentence
+      // Find the FIRST sentence that matches and has no translation yet
+      const idx = s.sentences.findIndex(
+        (sent, i) => sent === text && s.translations[i] === null
+      );
+
+      if (idx >= 0) {
+        // Update existing utterance
+        s.translations[idx] = translation;
+        s.pendingTranslations = Math.max(0, s.pendingTranslations - 1);
+
+        if (s.utteranceId) {
+          this.queue.upsert(s.utteranceId, {
+            translatedText: s.translations.filter(Boolean).join(" "),
+          });
+          this.emitSnapshot();
+        }
+      } else if (s.utteranceId) {
+        // Sentence not found in current — might be a late arrival.
+        // Append to current utterance anyway.
+        s.sentences.push(text);
+        s.translations.push(translation);
+
+        this.queue.upsert(s.utteranceId, {
+          originalText: s.sentences.join(" "),
+          translatedText: s.translations.filter(Boolean).join(" "),
+        });
+        this.emitSnapshot();
+      }
+      // If no current utterance, it's a very late arrival — discard silently.
+
+      this.tryFinalize(speaker);
+    }
+  }
+
+  // ── End of turn: Deepgram detected silence ──
+
+  private handleEndOfTurn(speaker: Speaker): void {
+    const s = this.sp(speaker);
+    s.pendingEnd = true;
+    this.tryFinalize(speaker);
+  }
+
+  // ── Try to finalize: only when pendingEnd=true AND all translations are in ──
+
+  private tryFinalize(speaker: Speaker): void {
+    const s = this.sp(speaker);
+    if (!s.pendingEnd) return;
+    if (s.pendingTranslations > 0) return;
+
+    // All translations received + silence detected → finalize
+    if (s.utteranceId) {
+      this.queue.upsert(s.utteranceId, { status: "done" as UtteranceStatus });
     }
 
-    session.connect();
-    this.scheduleTokenRefresh(speaker, token.expiresAt);
+    // Reset speaker state for next utterance
+    const fresh = emptySpeakerState();
+    if (speaker === "you") this.you = fresh;
+    else this.them = fresh;
+
     this.emitSnapshot();
   }
 
-  private wireSessionEvents(
-    session: GeminiLiveSession,
-    speaker: Speaker,
-  ): void {
-    session.on("state-change", () => {
-      this.emitSnapshot();
-    });
-
-    session.on("transcript", (event) => {
-      const utteranceId = this.ensureUtterance(speaker);
-      if (!utteranceId) return;
-
-      this.queue.upsert(utteranceId, {
-        status: "processing" as UtteranceStatus,
-        originalText: event.text,
-      });
-      this.emitSnapshot();
-    });
-
-    session.on("translation", (event) => {
-      const utteranceId = this.ensureUtterance(speaker);
-      if (!utteranceId) return;
-
-      this.queue.upsert(utteranceId, {
-        status: "processing" as UtteranceStatus,
-        translatedText: event.text,
-      });
-      this.emitSnapshot();
-    });
-
-    session.on("turn-complete", () => {
-      const utteranceId =
-        speaker === "you"
-          ? this.currentYouUtteranceId
-          : this.currentThemUtteranceId;
-
-      if (utteranceId) {
-        const existing = this.queue.getById(utteranceId);
-        if (existing && existing.status !== "failed") {
-          this.queue.upsert(utteranceId, { status: "done" as UtteranceStatus });
-        }
-      }
-
-      if (speaker === "you") {
-        this.currentYouUtteranceId = null;
-      } else {
-        this.currentThemUtteranceId = null;
-      }
-      this.emitSnapshot();
-    });
-
-    session.on("interrupted", () => {
-      if (speaker === "you") {
-        this.currentYouUtteranceId = null;
-      } else {
-        this.currentThemUtteranceId = null;
-      }
-      this.emitSnapshot();
-    });
-
-    session.on("error", (err) => {
-      console.error(`[SessionManager] ${speaker} session error:`, err.message);
-    });
-
-    session.on("close", () => {
-      // Reconnection is handled by GeminiLiveSession internally
-    });
-  }
+  // ── Ensure utterance exists for speaker ──
 
   private ensureUtterance(speaker: Speaker): string | null {
     if (!this.isRunning) return null;
-
-    const currentId =
-      speaker === "you"
-        ? this.currentYouUtteranceId
-        : this.currentThemUtteranceId;
-
-    if (currentId) return currentId;
-
-    const sourceLang =
-      speaker === "you"
-        ? this.config.language.youSource
-        : this.config.language.themSource;
-    const targetLang =
-      speaker === "you"
-        ? this.config.language.youTarget
-        : this.config.language.themTarget;
+    const s = this.sp(speaker);
+    if (s.utteranceId) return s.utteranceId;
 
     const utterance = this.queue.create({
       speaker,
       timestamp: Date.now(),
-      sourceLang,
-      targetLang,
+      sourceLang: speaker === "you" ? this.config.language.youSource : this.config.language.themSource,
+      targetLang: speaker === "you" ? this.config.language.youTarget : this.config.language.themTarget,
     });
 
-    if (speaker === "you") {
-      this.currentYouUtteranceId = utterance.id;
-    } else {
-      this.currentThemUtteranceId = utterance.id;
-    }
-
+    s.utteranceId = utterance.id;
     return utterance.id;
   }
 
-  private async acquireToken(): Promise<{
-    token: string;
-    expiresAt: string;
-  } | null> {
-    if (!this.accessToken) return null;
+  // ── Send to worker ──
 
-    try {
-      const response = await this.tokenClient.requestToken(this.accessToken);
-      this.dailyRemainingMs = response.dailyRemainingMs;
-      return { token: response.token, expiresAt: response.expiresAt };
-    } catch (err) {
-      if (err instanceof TokenServiceError) {
-        this.lastError = `Token error: ${err.message}`;
-      } else {
-        this.lastError =
-          err instanceof Error ? err.message : "Token acquisition failed";
-      }
-      this.emitSnapshot();
-      return null;
-    }
-  }
-
-  private scheduleTokenRefresh(speaker: Speaker, expiresAt: string): void {
-    const expiresAtMs = new Date(expiresAt).getTime();
-    const refreshAt =
-      expiresAtMs - Date.now() - SESSION_LIMITS.tokenRefreshBeforeExpiryMs;
-    const delay = Math.max(refreshAt, 60_000); // At least 1 minute
-
-    const timer = setTimeout(async () => {
-      if (!this.isRunning) return;
-
-      try {
-        const newToken = await this.acquireToken();
-        if (!newToken) return;
-
-        const session =
-          speaker === "you" ? this.youSession : this.themSession;
-        if (session) {
-          session.updateToken(newToken.token);
-          session.disconnect();
-          session.connect();
-          this.scheduleTokenRefresh(speaker, newToken.expiresAt);
-        }
-      } catch (err) {
-        console.error(
-          `[SessionManager] Token refresh failed for ${speaker}:`,
-          err,
-        );
-      }
-    }, delay);
-
-    this.tokenRefreshTimers.push(timer);
+  private send(msg: Record<string, unknown>): void {
+    if (this.ws?.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify(msg));
   }
 
   pushMicAudio(base64Pcm: string): void {
-    this.youSession?.sendAudio(base64Pcm);
+    this.send({ type: "audio", speaker: "you", data: base64Pcm });
   }
 
   pushSystemAudio(base64Pcm: string): void {
-    this.themSession?.sendAudio(base64Pcm);
+    this.send({ type: "audio", speaker: "them", data: base64Pcm });
   }
 
   stopSessions(): void {
-    // Report actual usage duration
-    if (this.sessionStartedAt && this.accessToken) {
-      const durationMs = Date.now() - this.sessionStartedAt;
-      void this.tokenClient.reportUsage(this.accessToken, durationMs);
-    }
-
+    this.send({ type: "stop" });
     this.isRunning = false;
     this.sessionStartedAt = null;
-    this.currentYouUtteranceId = null;
-    this.currentThemUtteranceId = null;
-
-    for (const timer of this.tokenRefreshTimers) {
-      clearTimeout(timer);
-    }
-    this.tokenRefreshTimers = [];
-
-    this.youSession?.disconnect();
-    this.themSession?.disconnect();
-    this.youSession = null;
-    this.themSession = null;
-
+    this.you = emptySpeakerState();
+    this.them = emptySpeakerState();
+    this.youState = "disconnected";
+    this.themState = "disconnected";
+    if (this.ws) { try { this.ws.close(); } catch { /* */ } this.ws = null; }
     this.emitSnapshot();
   }
 
   async resetUsage(): Promise<void> {
     if (!this.accessToken) return;
-    await this.tokenClient.resetUsage(this.accessToken);
-    this.dailyRemainingMs = SESSION_LIMITS.dailySessionMs;
-    this.lastError = null;
-    this.emitSnapshot();
+    try {
+      await fetch(`${this.config.tokenServiceUrl}/api/reset-usage`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${this.accessToken}`, "Content-Type": "application/json" },
+      });
+      this.dailyRemainingMs = SESSION_LIMITS.dailySessionMs;
+      this.lastError = null;
+      this.emitSnapshot();
+    } catch { /* */ }
   }
 
   clearUtterances(): void {
