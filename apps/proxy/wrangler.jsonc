@@ -1,6 +1,7 @@
 {
   "name": "realtime-translate-proxy",
   "main": "src/index.ts",
+  "account_id": "93c083772496870c5d1fb3d16d4f369f",
   "compatibility_date": "2026-04-11",
   "migrations": [
     {
