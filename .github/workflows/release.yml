@@ -46,6 +46,8 @@ jobs:
           MAKE_TARGETS: ${{ matrix.make-targets }}
           NODE_ENV: production
           TOKEN_SERVICE_URL: ${{ vars.TOKEN_SERVICE_URL }}
+          SUPABASE_URL: ${{ vars.SUPABASE_URL }}
+          SUPABASE_PUBLISHABLE_KEY: ${{ vars.SUPABASE_PUBLISHABLE_KEY }}
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4

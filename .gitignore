@@ -36,4 +36,8 @@ yarn-error.log*
 # Misc
 .DS_Store
 *.pem
+.mcp.json
+new_ui/
+CLAUDE.md
+plan.md
 .dev.vars
