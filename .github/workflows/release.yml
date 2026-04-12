@@ -16,13 +16,10 @@ jobs:
         include:
           - os: macos-latest
             platform: darwin
-            make-targets: '@electron-forge/maker-zip'
           - os: windows-latest
             platform: win32
-            make-targets: '@electron-forge/maker-squirrel'
           - os: ubuntu-latest
             platform: linux
-            make-targets: '@electron-forge/maker-deb'
 
     runs-on: ${{ matrix.os }}
 
@@ -41,10 +38,9 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y rpm
 
       - name: Build Electron app
-        run: npx electron-forge make --targets "$MAKE_TARGETS"
+        run: npx electron-forge make
         working-directory: apps/desktop
         env:
-          MAKE_TARGETS: ${{ matrix.make-targets }}
           NODE_ENV: production
           TOKEN_SERVICE_URL: ${{ vars.TOKEN_SERVICE_URL }}
           SUPABASE_URL: ${{ vars.SUPABASE_URL }}
