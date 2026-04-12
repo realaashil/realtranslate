@@ -429,19 +429,16 @@ const toggleOverlay = (): boolean => {
   return true;
 };
 
-const resolveTrayIconPath = (): string => {
+const resolveTrayIconPath = (): string | null => {
   const candidatePaths = [
-    path.join(__dirname, "../assets/iconTemplate.png"),
-    path.join(__dirname, "../../src/assets/iconTemplate.png"),
-    path.join(process.cwd(), "src/assets/iconTemplate.png"),
+    path.join(__dirname, "../assets/trayIcon.png"),
+    path.join(__dirname, "../../src/assets/trayIcon.png"),
+    path.join(__dirname, "../../../src/assets/trayIcon.png"),
+    path.join(process.cwd(), "src/assets/trayIcon.png"),
+    path.join(process.cwd(), "apps/desktop/src/assets/trayIcon.png"),
   ];
 
-  const found = candidatePaths.find((candidate) => fs.existsSync(candidate));
-  if (!found) {
-    throw new Error("Tray icon asset not found");
-  }
-
-  return found;
+  return candidatePaths.find((candidate) => fs.existsSync(candidate)) ?? null;
 };
 
 const createOverlayWindow = (): BrowserWindow => {
@@ -489,7 +486,12 @@ const createOverlayWindow = (): BrowserWindow => {
 };
 
 const createTray = (): void => {
-  tray = new Tray(resolveTrayIconPath());
+  const iconPath = resolveTrayIconPath();
+  if (!iconPath) {
+    console.warn("[Main] Tray icon not found, skipping tray creation");
+    return;
+  }
+  tray = new Tray(iconPath);
 
   const menu = Menu.buildFromTemplate([
     { label: "Toggle Overlay", click: () => toggleOverlay() },
