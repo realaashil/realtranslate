@@ -31,6 +31,8 @@ export const SESSION_LIMITS = {
   tokenLifetimeMs: 1_800_000,
   tokenRefreshBeforeExpiryMs: 300_000,
   maxTokensPerUserPerHour: 10,
+  maxSessionDurationMs: 1_800_000, // 30 minutes per session
+  sessionWarningBeforeEndMs: 300_000, // warn 5 min before
 } as const;
 
 export const CONTEXT_WINDOW_COMPRESSION = {

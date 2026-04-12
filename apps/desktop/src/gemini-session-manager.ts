@@ -20,6 +20,7 @@ export interface LanguageSettings {
 export interface GeminiSessionManagerConfig {
   tokenServiceUrl: string;
   deepgramApiKey?: string;
+  deviceId: string;
   language: LanguageSettings;
 }
 
@@ -41,7 +42,8 @@ type ServerMsg =
   | { type: "partial"; speaker: Speaker; text: string }
   | { type: "sentence"; speaker: Speaker; text: string; translation: string | null }
   | { type: "end_of_turn"; speaker: Speaker }
-  | { type: "error"; message: string };
+  | { type: "error"; message: string }
+  | { type: "session_ending"; remainingMs: number };
 
 // Track each sentence by index, not by text matching
 interface SpeakerState {
@@ -124,7 +126,12 @@ export class GeminiSessionManager {
   }
 
   private connectWebSocket(): void {
-    const wsUrl = this.config.tokenServiceUrl.replace(/^http/, "ws") + "/ws";
+    const base = this.config.tokenServiceUrl.replace(/^http/, "ws");
+    const params = new URLSearchParams({
+      token: this.accessToken!,
+      deviceId: this.config.deviceId,
+    });
+    const wsUrl = `${base}/ws?${params}`;
     this.ws = new WebSocket(wsUrl);
 
     this.ws.on("open", () => {
@@ -175,6 +182,13 @@ export class GeminiSessionManager {
 
     if (msg.type === "error") {
       this.lastError = msg.message;
+      this.emitSnapshot();
+      return;
+    }
+
+    if (msg.type === "session_ending") {
+      const mins = Math.ceil(msg.remainingMs / 60000);
+      this.lastError = `Session ending in ${mins} min`;
       this.emitSnapshot();
       return;
     }

@@ -32,10 +32,9 @@
   "vars": {
     "SUPABASE_URL": "https://hqvyqvxgumcoeedoijbn.supabase.co",
     "SUPABASE_JWT_AUDIENCE": "authenticated",
-    "SUPABASE_JWT_ISSUER": "",
-    "GEMINI_API_KEY": "AIzaSyC89O5ywEoZqiOGlVI_w4eMu0JKzgJpk9I",
-    "DEEPGRAM_API_KEY": "2c9aeb01caa3bb1a8e741e4dcf61caf38ab95405"
+    "SUPABASE_JWT_ISSUER": ""
   },
+  // GEMINI_API_KEY and DEEPGRAM_API_KEY are set via `wrangler secret put`
   "observability": {
     "enabled": true
   }

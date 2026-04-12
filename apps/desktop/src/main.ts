@@ -202,9 +202,22 @@ const supabase = createClient(supabaseUrl, supabasePublishableKey, {
 
 const deepgramApiKey = process.env.DEEPGRAM_API_KEY ?? "";
 
+const deviceId = (() => {
+  const store = settingsStore as unknown as {
+    get: <T>(k: string, d: T) => T;
+    set: <T>(k: string, v: T) => void;
+  };
+  const stored = store.get("deviceId", "");
+  if (stored) return stored;
+  const id = crypto.randomUUID();
+  store.set("deviceId", id);
+  return id;
+})();
+
 const sessionManager = new GeminiSessionManager({
   tokenServiceUrl: appSettings.tokenServiceUrl,
   deepgramApiKey,
+  deviceId,
   language: appSettings.language as GeminiLanguageSettings,
 });
 

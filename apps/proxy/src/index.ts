@@ -111,10 +111,42 @@ export class TranslationSession {
   private youTarget = "hi-IN";
   private themTarget = "en-US";
   private authenticated = false;
+  private sessionStartedAt: number | null = null;
 
   constructor(state: DurableObjectState, env: Env) {
     this.state = state;
     this.env = env;
+  }
+
+  // Alarm fires when session time limit is reached
+  async alarm(): Promise<void> {
+    if (!this.sessionStartedAt) return;
+
+    const elapsed = Date.now() - this.sessionStartedAt;
+    const max = SESSION_LIMITS.maxSessionDurationMs;
+    const warning = max - SESSION_LIMITS.sessionWarningBeforeEndMs;
+
+    if (elapsed < warning) {
+      // Too early — reschedule (shouldn't happen, but be safe)
+      await this.state.storage.setAlarm(this.sessionStartedAt + warning);
+      return;
+    }
+
+    if (elapsed < max) {
+      // Warning phase — notify client, schedule final alarm
+      const remainingMs = max - elapsed;
+      this.sendToClient({ type: "session_ending", remainingMs });
+      await this.state.storage.setAlarm(this.sessionStartedAt + max);
+      return;
+    }
+
+    // Time's up
+    this.sendToClient({ type: "error", message: "Session time limit reached (30 minutes)" });
+    this.cleanup();
+    if (this.client) {
+      try { this.client.close(4008, "Session time limit reached"); } catch { /* */ }
+      this.client = null;
+    }
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -154,6 +186,12 @@ export class TranslationSession {
         return;
       }
       this.authenticated = true;
+      this.sessionStartedAt = Date.now();
+
+      // Schedule warning alarm at 25 min
+      const warningAt = this.sessionStartedAt + SESSION_LIMITS.maxSessionDurationMs - SESSION_LIMITS.sessionWarningBeforeEndMs;
+      await this.state.storage.setAlarm(warningAt);
+
       this.sendToClient({ type: "auth_ok" });
       return;
     }
@@ -287,7 +325,7 @@ export class TranslationSession {
 }
 
 type ClientMsg =
-  | { type: "auth"; token: string }
+  | { type: "auth"; token: string; deviceId?: string }
   | { type: "config"; youTarget?: string; themTarget?: string }
   | { type: "start" }
   | { type: "audio"; speaker: "you" | "them"; data: string }
@@ -300,7 +338,8 @@ type ServerMsg =
   | { type: "partial"; speaker: "you" | "them"; text: string }
   | { type: "sentence"; speaker: "you" | "them"; text: string; translation: string | null }
   | { type: "end_of_turn"; speaker: "you" | "them" }
-  | { type: "error"; message: string };
+  | { type: "error"; message: string }
+  | { type: "session_ending"; remainingMs: number };
 
 interface DeepgramMsg {
   type?: string;
@@ -347,7 +386,22 @@ app.get("/ws", async (c) => {
     return new Response("Expected WebSocket", { status: 426 });
   }
 
-  const id = c.env.TRANSLATION_SESSION.idFromName("session");
+  // Auth + device routing via query params (WS upgrade can't carry body)
+  const token = c.req.query("token");
+  const deviceId = c.req.query("deviceId") ?? "default";
+
+  if (!token) {
+    return new Response("Missing token query param", { status: 401 });
+  }
+
+  const claims = await verifySupabaseToken(token, c.env);
+  if (!claims) {
+    return new Response("Invalid token", { status: 401 });
+  }
+
+  // Per-user-per-device DO instance
+  const doName = `${claims.sub}:${deviceId}`;
+  const id = c.env.TRANSLATION_SESSION.idFromName(doName);
   const stub = c.env.TRANSLATION_SESSION.get(id);
   return stub.fetch(c.req.raw);
 });
