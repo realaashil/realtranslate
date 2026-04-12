@@ -4,26 +4,30 @@
   "scripts": {
     "build": "turbo run build",
     "dev": "turbo run dev",
-    "dev:web": "pnpm --filter web dev",
-    "dev:desktop": "pnpm --filter desktop start",
-    "dev:proxy": "pnpm --filter proxy dev",
+    "dev:web": "dotenv -e .env -- npm run dev -w web",
+    "dev:desktop": "dotenv -e .env -- npm run start -w desktop",
+    "dev:proxy": "dotenv -e .env -- npm run dev -w proxy",
     "lint": "turbo run lint",
     "format": "prettier --write \"**/*.{ts,tsx,md}\"",
     "check-types": "turbo run check-types"
   },
   "devDependencies": {
+    "dotenv-cli": "^8.0.0",
+    "electron": "41.2.0",
     "prettier": "^3.7.4",
     "turbo": "^2.9.6",
     "typescript": "5.9.2"
   },
-  "packageManager": "pnpm@10.0.0",
+  "packageManager": "npm@10.9.0",
   "engines": {
     "node": ">=18"
   },
-  "pnpm": {
-    "overrides": {
-      "esbuild": "0.28.0",
-      "@esbuild/*": "0.28.0"
-    }
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "overrides": {
+    "esbuild": "0.28.0",
+    "@esbuild/*": "0.28.0"
   }
 }

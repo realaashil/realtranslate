@@ -12,7 +12,6 @@ export interface UpdateUtteranceInput {
   status?: UtteranceStatus;
   originalText?: string;
   translatedText?: string;
-  confidence?: number;
 }
 
 const buildUtteranceId = (speaker: Speaker, timestamp: number): string =>
@@ -47,7 +46,6 @@ export class ConversationQueue {
       translatedText: "",
       sourceLang: input.sourceLang,
       targetLang: input.targetLang,
-      confidence: 0,
     };
 
     this.itemsById.set(id, utterance);
@@ -97,5 +95,9 @@ export class ConversationQueue {
 
   getById(id: string): Utterance | undefined {
     return this.itemsById.get(id);
+  }
+
+  clear(): void {
+    this.itemsById.clear();
   }
 }

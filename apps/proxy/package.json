@@ -11,7 +11,8 @@
 		"check-types": "tsc --noEmit"
 	},
 	"dependencies": {
-		"@realtime/shared": "workspace:*",
+		"@google/genai": "^1.49.0",
+		"@realtime/shared": "file:../../packages/shared",
 		"hono": "^4.6.10",
 		"jose": "^5.9.6",
 		"zod": "^3.23.8"

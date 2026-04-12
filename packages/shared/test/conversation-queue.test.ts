@@ -77,13 +77,11 @@ describe("ConversationQueue", () => {
     });
 
     const updated = queue.upsert(created.id, {
-      status: "transcribing",
+      status: "processing",
       originalText: "hello there",
-      confidence: 0.93,
     });
 
-    expect(updated.status).toBe("transcribing");
+    expect(updated.status).toBe("processing");
     expect(updated.originalText).toBe("hello there");
-    expect(updated.confidence).toBe(0.93);
   });
 });

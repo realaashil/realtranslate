@@ -7,56 +7,54 @@ import {
   ipcMain,
 } from "electron";
 import { createClient, type Session, type User } from "@supabase/supabase-js";
-import { execSync } from "node:child_process";
+import Store from "electron-store";
+import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import started from "electron-squirrel-startup";
+
+import type { SupportedLanguage, Utterance } from "@realtime/shared";
 
 import {
   MeetingOrchestrator,
   type MeetingSnapshot,
 } from "./meeting-orchestrator";
 import {
-  TranslationProxyClient,
-  type ProxyConnectionState,
-  type ServerMessage,
-} from "./proxy-client";
+  GeminiSessionManager,
+  type LanguageSettings as GeminiLanguageSettings,
+  type SessionManagerSnapshot,
+} from "./gemini-session-manager";
+import type { SessionState } from "./gemini-live-session";
+import {
+  startSystemAudioCapture,
+  getDesktopSourceId,
+  type SystemAudioCapture,
+} from "./audio-capture";
+
+// ── Types ──
 
 type MeetingLifecycle = "idle" | "prompt" | "active" | "stopping";
-
 type DetectionDecision = "auto-start" | "prompt" | "idle";
 type AuthStatus = "signed_out" | "signing_in" | "signed_in";
+
+interface LanguageSettings {
+  youSource: string;
+  youTarget: string;
+  themSource: string;
+  themTarget: string;
+}
+
+interface AppSettings {
+  tokenServiceUrl: string;
+  language: LanguageSettings;
+  overlayBounds: OverlayBounds;
+}
 
 interface OverlayBounds {
   x: number;
   y: number;
   width: number;
   height: number;
-}
-
-type Speaker = "you" | "them";
-type UtteranceStatus =
-  | "listening"
-  | "transcribing"
-  | "translating"
-  | "done"
-  | "failed";
-
-interface PipelineUtterance {
-  id: string;
-  speaker: Speaker;
-  timestamp: number;
-  status: UtteranceStatus;
-  originalText: string;
-  translatedText: string;
-  sourceLang: string;
-  targetLang: string;
-  confidence: number;
-}
-
-interface RateWarning {
-  remaining: number;
-  limit: number;
 }
 
 interface AuthSnapshot {
@@ -68,16 +66,15 @@ interface AuthSnapshot {
 
 interface PipelineSnapshot {
   isRunning: boolean;
-  proxyConnection: ProxyConnectionState;
+  youSessionState: SessionState;
+  themSessionState: SessionState;
   meetingLifecycle: MeetingLifecycle;
   meetingScore: number;
   meetingDecision: DetectionDecision;
   autoStopSecondsRemaining: number | null;
-  utterances: PipelineUtterance[];
-  rateWarning: RateWarning | null;
+  utterances: Utterance[];
   dailyRemainingMs: number | null;
-  sessionResetAtUtc: string | null;
-  lastProxyNotice: string | null;
+  error: string | null;
   activeLanguagePair: string;
   auth: AuthSnapshot;
 }
@@ -86,6 +83,8 @@ interface AuthSignInInput {
   email: string;
   password: string;
 }
+
+// ── Constants ──
 
 const MEETING_PROCESS_HINTS = [
   "zoom",
@@ -96,45 +95,128 @@ const MEETING_PROCESS_HINTS = [
   "meet",
 ] as const;
 
-const YOU_SOURCE_LANG = "en-US";
-const YOU_TARGET_LANG = "hi-IN";
-const THEM_SOURCE_LANG = "es-ES";
-const THEM_TARGET_LANG = "en-US";
+const DEFAULT_TOKEN_SERVICE_URL =
+  process.env.TOKEN_SERVICE_URL ?? "http://127.0.0.1:8787";
+const DEFAULT_LANGUAGE_SETTINGS: LanguageSettings = {
+  youSource: "auto",
+  youTarget: "hi-IN",
+  themSource: "auto",
+  themTarget: "en-US",
+};
+const DEFAULT_OVERLAY_BOUNDS: OverlayBounds = {
+  x: 160,
+  y: 580,
+  width: 980,
+  height: 440,
+};
 
-const YOU_PHRASES = [
-  "Can everyone hear me clearly?",
-  "Let's begin the architecture review.",
-  "Please share your deployment status.",
-  "I will summarize the action items.",
-] as const;
-
-const THEM_PHRASES = [
-  "Audio is clear from our side.",
-  "The API rollout is currently stable.",
-  "We completed integration testing.",
-  "I will send the final notes shortly.",
-] as const;
+// ── State ──
 
 let overlayWindow: BrowserWindow | null = null;
 let tray: Tray | null = null;
 
-const utterances = new Map<string, PipelineUtterance>();
-let pipelineTimers: NodeJS.Timeout[] = [];
 let isPipelineRunning = false;
-let utteranceSequence = 0;
-let proxyConnectionState: ProxyConnectionState = "disconnected";
 let lastSpeechAt = 0;
-
-let rateWarning: RateWarning | null = null;
-let dailyRemainingMs: number | null = null;
-let sessionResetAtUtc: string | null = null;
-let lastProxyNotice: string | null = null;
 
 let authStatus: AuthStatus = "signed_out";
 let authUserEmail: string | null = null;
 let authUserId: string | null = null;
 let authError: string | null = null;
 let authAccessToken: string | null = null;
+
+let lastSessionManagerSnapshot: SessionManagerSnapshot | null = null;
+let systemAudioCapture: SystemAudioCapture | null = null;
+
+// ── Settings ──
+
+const settingsStore = new Store({
+  defaults: {
+    tokenServiceUrl: DEFAULT_TOKEN_SERVICE_URL,
+    language: DEFAULT_LANGUAGE_SETTINGS,
+    overlayBounds: DEFAULT_OVERLAY_BOUNDS,
+  },
+});
+
+const readSettings = (): AppSettings => {
+  const store = settingsStore as unknown as {
+    get: <T>(key: string, defaultValue: T) => T;
+  };
+
+  return {
+    tokenServiceUrl: store.get("tokenServiceUrl", DEFAULT_TOKEN_SERVICE_URL),
+    language: store.get("language", DEFAULT_LANGUAGE_SETTINGS),
+    overlayBounds: store.get("overlayBounds", DEFAULT_OVERLAY_BOUNDS),
+  };
+};
+
+const writeSetting = <T>(key: string, value: T): void => {
+  const store = settingsStore as unknown as {
+    set: <U>(settingKey: string, settingValue: U) => void;
+  };
+  store.set(key, value);
+};
+
+let appSettings: AppSettings = readSettings();
+
+// ── Squirrel Startup ──
+
+if (started) {
+  app.quit();
+}
+
+// ── Supabase Auth ──
+
+const supabaseUrl = process.env.SUPABASE_URL;
+const supabasePublishableKey =
+  process.env.SUPABASE_PUBLISHABLE_KEY ?? process.env.SUPABASE_ANON_KEY;
+
+if (!supabaseUrl || !supabasePublishableKey) {
+  throw new Error(
+    "Missing SUPABASE_URL or SUPABASE_PUBLISHABLE_KEY for desktop auth",
+  );
+}
+
+// Custom storage adapter for Supabase session persistence in Electron main process
+const authStore = new Store({ name: "supabase-auth" });
+const supabaseStorage = {
+  getItem: (key: string): string | null => {
+    return (authStore as unknown as { get: (k: string, d: string | null) => string | null }).get(key, null);
+  },
+  setItem: (key: string, value: string): void => {
+    (authStore as unknown as { set: (k: string, v: string) => void }).set(key, value);
+  },
+  removeItem: (key: string): void => {
+    (authStore as unknown as { delete: (k: string) => void }).delete(key);
+  },
+};
+
+const supabase = createClient(supabaseUrl, supabasePublishableKey, {
+  auth: {
+    autoRefreshToken: true,
+    persistSession: true,
+    storage: supabaseStorage,
+  },
+});
+
+// ── Gemini Session Manager ──
+
+const sessionManager = new GeminiSessionManager({
+  tokenServiceUrl: appSettings.tokenServiceUrl,
+  language: appSettings.language as GeminiLanguageSettings,
+});
+
+sessionManager.onSnapshot((snapshot) => {
+  lastSessionManagerSnapshot = snapshot;
+  isPipelineRunning = snapshot.isRunning;
+
+  if (snapshot.utterances.length > 0) {
+    lastSpeechAt = Date.now();
+  }
+
+  emitSnapshot();
+});
+
+// ── Meeting Detection ──
 
 let meetingSnapshot: MeetingSnapshot = {
   lifecycle: "idle",
@@ -151,27 +233,12 @@ let meetingSnapshot: MeetingSnapshot = {
   autoStopSecondsRemaining: null,
 };
 
-if (started) {
-  app.quit();
-}
+// ── Auth Helpers ──
 
-const supabaseUrl = process.env.SUPABASE_URL;
-const supabaseAnonKey = process.env.SUPABASE_ANON_KEY;
-
-if (!supabaseUrl || !supabaseAnonKey) {
-  throw new Error(
-    "Missing SUPABASE_URL or SUPABASE_ANON_KEY for desktop auth",
-  );
-}
-
-const supabase = createClient(supabaseUrl, supabaseAnonKey, {
-  auth: {
-    autoRefreshToken: true,
-    persistSession: true,
-  },
-});
-
-const applySession = (session: Session | null, userOverride?: User | null): void => {
+const applySession = (
+  session: Session | null,
+  userOverride?: User | null,
+): void => {
   authAccessToken = session?.access_token ?? null;
 
   const user = userOverride ?? session?.user ?? null;
@@ -179,6 +246,7 @@ const applySession = (session: Session | null, userOverride?: User | null): void
   authUserId = user?.id ?? null;
 
   authStatus = session ? "signed_in" : "signed_out";
+  sessionManager.setAccessToken(authAccessToken);
 
   if (!session && isPipelineRunning) {
     stopPipelines();
@@ -186,6 +254,105 @@ const applySession = (session: Session | null, userOverride?: User | null): void
 
   emitSnapshot();
 };
+
+// ── Snapshot ──
+
+const activeLanguagePair = (): string =>
+  `You → ${appSettings.language.youTarget} | Them → ${appSettings.language.themTarget}`;
+
+const authSnapshot = (): AuthSnapshot => ({
+  status: authStatus,
+  email: authUserEmail,
+  userId: authUserId,
+  error: authError,
+});
+
+const getSnapshot = (): PipelineSnapshot => {
+  const smSnapshot = lastSessionManagerSnapshot ?? sessionManager.getSnapshot();
+
+  return {
+    isRunning: smSnapshot.isRunning,
+    youSessionState: smSnapshot.youSessionState,
+    themSessionState: smSnapshot.themSessionState,
+    meetingLifecycle: meetingSnapshot.lifecycle,
+    meetingScore: meetingSnapshot.evaluation.score,
+    meetingDecision: meetingSnapshot.evaluation.decision,
+    autoStopSecondsRemaining: meetingSnapshot.autoStopSecondsRemaining,
+    utterances: smSnapshot.utterances,
+    dailyRemainingMs: smSnapshot.dailyRemainingMs,
+    error: smSnapshot.error,
+    activeLanguagePair: activeLanguagePair(),
+    auth: authSnapshot(),
+  };
+};
+
+const emitSnapshot = (): void => {
+  if (!overlayWindow || overlayWindow.isDestroyed()) return;
+  overlayWindow.webContents.send("pipelines:update", getSnapshot());
+};
+
+// ── Pipeline Controls ──
+
+const startPipelines = async (): Promise<PipelineSnapshot> => {
+  if (authStatus !== "signed_in" || !authAccessToken) {
+    emitSnapshot();
+    return getSnapshot();
+  }
+
+  if (isPipelineRunning) return getSnapshot();
+
+  await sessionManager.startSessions();
+
+  // Start system audio capture for the "them" stream
+  if (!systemAudioCapture) {
+    if (process.platform === "linux") {
+      // Linux: main-process capture via parec
+      systemAudioCapture = startSystemAudioCapture((base64Pcm) => {
+        sessionManager.pushSystemAudio(base64Pcm);
+      });
+      if (systemAudioCapture) {
+        console.log("[Main] System audio capture started (parec)");
+      }
+    } else {
+      // macOS/Windows: renderer-based capture via desktopCapturer
+      const sourceId = await getDesktopSourceId();
+      if (sourceId && overlayWindow && !overlayWindow.isDestroyed()) {
+        overlayWindow.webContents.send("system-audio:start", sourceId);
+        // Track as a capture so stopPipelines can clean up
+        systemAudioCapture = {
+          stop: () => {
+            if (overlayWindow && !overlayWindow.isDestroyed()) {
+              overlayWindow.webContents.send("system-audio:stop");
+            }
+          },
+        };
+        console.log("[Main] System audio capture started (desktopCapturer)");
+      }
+    }
+
+    if (!systemAudioCapture) {
+      console.warn("[Main] System audio capture unavailable — them stream disabled");
+    }
+  }
+
+  return getSnapshot();
+};
+
+const stopPipelines = (): PipelineSnapshot => {
+  if (systemAudioCapture) {
+    systemAudioCapture.stop();
+    systemAudioCapture = null;
+  }
+  sessionManager.stopSessions();
+  return getSnapshot();
+};
+
+const clearUtterances = (): PipelineSnapshot => {
+  sessionManager.clearUtterances();
+  return getSnapshot();
+};
+
+// ── Overlay Window ──
 
 const getRendererUrl = (): string => {
   if (
@@ -216,115 +383,6 @@ const resolvePreloadPath = (): string => {
   return found;
 };
 
-const compareUtterances = (
-  left: PipelineUtterance,
-  right: PipelineUtterance,
-): number => {
-  const delta = left.timestamp - right.timestamp;
-
-  if (Math.abs(delta) <= 50 && left.speaker !== right.speaker) {
-    return left.speaker === "them" ? -1 : 1;
-  }
-
-  return delta;
-};
-
-const activeLanguagePair = (): string => `${YOU_SOURCE_LANG} → ${YOU_TARGET_LANG}`;
-
-const authSnapshot = (): AuthSnapshot => ({
-  status: authStatus,
-  email: authUserEmail,
-  userId: authUserId,
-  error: authError,
-});
-
-const getSnapshot = (): PipelineSnapshot => {
-  const ordered = [...utterances.values()].sort(compareUtterances);
-  return {
-    isRunning: isPipelineRunning,
-    proxyConnection: proxyConnectionState,
-    meetingLifecycle: meetingSnapshot.lifecycle,
-    meetingScore: meetingSnapshot.evaluation.score,
-    meetingDecision: meetingSnapshot.evaluation.decision,
-    autoStopSecondsRemaining: meetingSnapshot.autoStopSecondsRemaining,
-    utterances: ordered,
-    rateWarning,
-    dailyRemainingMs,
-    sessionResetAtUtc,
-    lastProxyNotice,
-    activeLanguagePair: activeLanguagePair(),
-    auth: authSnapshot(),
-  };
-};
-
-const emitSnapshot = (): void => {
-  if (!overlayWindow || overlayWindow.isDestroyed()) {
-    return;
-  }
-
-  overlayWindow.webContents.send("pipelines:update", getSnapshot());
-};
-
-const handleProxyServerMessage = (message: ServerMessage): void => {
-  switch (message.type) {
-    case "auth_ok":
-      dailyRemainingMs = message.dailyRemainingMs;
-      sessionResetAtUtc = null;
-      lastProxyNotice = null;
-      break;
-    case "rate_warning":
-      rateWarning = {
-        remaining: message.remaining,
-        limit: message.limit,
-      };
-      break;
-    case "session_warning":
-      dailyRemainingMs = message.dailyRemainingMs;
-      break;
-    case "session_expired":
-      sessionResetAtUtc = message.resetAtUtc;
-      lastProxyNotice = `Session expired. Resets at ${message.resetAtUtc}`;
-      break;
-    case "rate_limited":
-      lastProxyNotice = `Rate limited. Retry after ${message.retryAfterMs}ms`;
-      break;
-    case "error":
-      if (!message.utteranceId) {
-        lastProxyNotice = message.message;
-
-        if (message.code === "unauthorized" || message.code === "session_required") {
-          authStatus = "signed_out";
-          authError = message.message;
-          authAccessToken = null;
-        }
-      }
-      break;
-    case "translation_chunk":
-    case "pong":
-      break;
-  }
-
-  emitSnapshot();
-};
-
-const proxyClient = new TranslationProxyClient({
-  url: process.env.PROXY_WS_URL ?? "ws://127.0.0.1:8787/ws",
-  credentialsProvider: () => ({
-    token: authAccessToken,
-    deviceId: process.env.PROXY_DEVICE_ID ?? "desktop-dev-device",
-  }),
-  onConnectionStateChange: (state) => {
-    proxyConnectionState = state;
-
-    if (state === "connected") {
-      lastProxyNotice = null;
-    }
-
-    emitSnapshot();
-  },
-  onServerMessage: handleProxyServerMessage,
-});
-
 const toOverlayBounds = (window: BrowserWindow): OverlayBounds => {
   const bounds = window.getBounds();
   return {
@@ -335,190 +393,16 @@ const toOverlayBounds = (window: BrowserWindow): OverlayBounds => {
   };
 };
 
-const updateUtterance = (
-  utteranceId: string,
-  changes: Partial<PipelineUtterance>,
-): void => {
-  const current = utterances.get(utteranceId);
-  if (!current) {
-    return;
-  }
+const persistOverlayBounds = (): void => {
+  if (!overlayWindow || overlayWindow.isDestroyed()) return;
 
-  utterances.set(utteranceId, {
-    ...current,
-    ...changes,
-  });
-
-  emitSnapshot();
-};
-
-const translateUtterance = async (
-  utteranceId: string,
-  phrase: string,
-): Promise<void> => {
-  const current = utterances.get(utteranceId);
-  if (!current) {
-    return;
-  }
-
-  try {
-    const translated = await proxyClient.translate({
-      utteranceId,
-      text: phrase,
-      sourceLang: current.sourceLang,
-      targetLang: current.targetLang,
-      speaker: current.speaker,
-    });
-
-    updateUtterance(utteranceId, {
-      status: "done",
-      translatedText: translated,
-    });
-  } catch (error) {
-    const message =
-      error instanceof Error ? error.message : "Translation request failed";
-
-    updateUtterance(utteranceId, {
-      status: "failed",
-      translatedText: message,
-    });
-  }
-};
-
-const createPipelineUtterance = (
-  speaker: Speaker,
-  sourceLang: string,
-  targetLang: string,
-): string => {
-  const timestamp = Date.now();
-  utteranceSequence += 1;
-
-  const utteranceId = `${speaker}-${timestamp}-${utteranceSequence}`;
-
-  const utterance: PipelineUtterance = {
-    id: utteranceId,
-    speaker,
-    timestamp,
-    status: "listening",
-    originalText: "",
-    translatedText: "",
-    sourceLang,
-    targetLang,
-    confidence: 0,
-  };
-
-  utterances.set(utteranceId, utterance);
-  emitSnapshot();
-
-  return utteranceId;
-};
-
-const scheduleStateProgression = (
-  utteranceId: string,
-  phrase: string,
-): void => {
-  const transcribingTimer = setTimeout(() => {
-    updateUtterance(utteranceId, {
-      status: "transcribing",
-      originalText: phrase,
-      confidence: 0.92,
-    });
-  }, 220);
-
-  const translatingTimer = setTimeout(() => {
-    updateUtterance(utteranceId, {
-      status: "translating",
-      originalText: phrase,
-      confidence: 0.96,
-    });
-
-    void translateUtterance(utteranceId, phrase);
-  }, 700);
-
-  pipelineTimers.push(transcribingTimer, translatingTimer);
-};
-
-const runPipelineTick = (speaker: Speaker): void => {
-  const phrasePool = speaker === "you" ? YOU_PHRASES : THEM_PHRASES;
-  const phrase = phrasePool[utteranceSequence % phrasePool.length];
-
-  const utteranceId =
-    speaker === "you"
-      ? createPipelineUtterance(speaker, YOU_SOURCE_LANG, YOU_TARGET_LANG)
-      : createPipelineUtterance(speaker, THEM_SOURCE_LANG, THEM_TARGET_LANG);
-
-  lastSpeechAt = Date.now();
-  scheduleStateProgression(utteranceId, phrase);
-};
-
-const clearPipelineTimers = (): void => {
-  pipelineTimers.forEach((timer) => {
-    clearTimeout(timer);
-    clearInterval(timer);
-  });
-
-  pipelineTimers = [];
-};
-
-const clearUtterances = (): PipelineSnapshot => {
-  utterances.clear();
-  emitSnapshot();
-  return getSnapshot();
-};
-
-const startPipelines = (): PipelineSnapshot => {
-  if (authStatus !== "signed_in" || !authAccessToken) {
-    lastProxyNotice = "Sign in with email before starting translation";
-    emitSnapshot();
-    return getSnapshot();
-  }
-
-  if (isPipelineRunning) {
-    return getSnapshot();
-  }
-
-  isPipelineRunning = true;
-  rateWarning = null;
-  sessionResetAtUtc = null;
-  lastProxyNotice = null;
-
-  emitSnapshot();
-
-  void proxyClient.connect().catch((error) => {
-    proxyConnectionState = "error";
-    lastProxyNotice =
-      error instanceof Error ? error.message : "Unable to connect proxy";
-    emitSnapshot();
-  });
-
-  runPipelineTick("you");
-  runPipelineTick("them");
-
-  const youInterval = setInterval(() => {
-    runPipelineTick("you");
-  }, 5800);
-
-  const themInterval = setInterval(() => {
-    runPipelineTick("them");
-  }, 5200);
-
-  pipelineTimers.push(youInterval, themInterval);
-
-  return getSnapshot();
-};
-
-const stopPipelines = (): PipelineSnapshot => {
-  isPipelineRunning = false;
-  clearPipelineTimers();
-  proxyClient.disconnect("meeting_ended");
-  emitSnapshot();
-  return getSnapshot();
+  const bounds = toOverlayBounds(overlayWindow);
+  appSettings = { ...appSettings, overlayBounds: bounds };
+  writeSetting("overlayBounds", bounds);
 };
 
 const toggleOverlay = (): boolean => {
-  if (!overlayWindow) {
-    return false;
-  }
+  if (!overlayWindow) return false;
 
   if (overlayWindow.isVisible()) {
     overlayWindow.hide();
@@ -546,12 +430,13 @@ const resolveTrayIconPath = (): string => {
 
 const createOverlayWindow = (): BrowserWindow => {
   const preloadPath = resolvePreloadPath();
+  const { overlayBounds } = appSettings;
 
   const window = new BrowserWindow({
-    width: 980,
-    height: 440,
-    x: 160,
-    y: 580,
+    width: overlayBounds.width,
+    height: overlayBounds.height,
+    x: overlayBounds.x,
+    y: overlayBounds.y,
     frame: false,
     transparent: true,
     alwaysOnTop: true,
@@ -577,6 +462,8 @@ const createOverlayWindow = (): BrowserWindow => {
   }
 
   window.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
+  window.on("moved", () => persistOverlayBounds());
+  window.on("resized", () => persistOverlayBounds());
 
   if (MAIN_WINDOW_VITE_DEV_SERVER_URL) {
     window.webContents.openDevTools({ mode: "detach" });
@@ -589,63 +476,31 @@ const createTray = (): void => {
   tray = new Tray(resolveTrayIconPath());
 
   const menu = Menu.buildFromTemplate([
-    {
-      label: "Toggle Overlay",
-      click: () => {
-        toggleOverlay();
-      },
-    },
-    {
-      label: "Start Translation",
-      click: () => {
-        startPipelines();
-      },
-    },
-    {
-      label: "Stop Translation",
-      click: () => {
-        stopPipelines();
-      },
-    },
-    {
-      label: "Clear Captions",
-      click: () => {
-        clearUtterances();
-      },
-    },
-    {
-      label: "Quit",
-      click: () => {
-        app.quit();
-      },
-    },
+    { label: "Toggle Overlay", click: () => toggleOverlay() },
+    { label: "Start Translation", click: () => void startPipelines() },
+    { label: "Stop Translation", click: () => stopPipelines() },
+    { label: "Clear Captions", click: () => clearUtterances() },
+    { label: "Quit", click: () => app.quit() },
   ]);
 
   tray.setToolTip("Realtime Translate Overlay");
   tray.setContextMenu(menu);
-  tray.on("click", () => {
-    toggleOverlay();
-  });
+  tray.on("click", () => toggleOverlay());
 };
 
 const registerShortcuts = (): void => {
-  globalShortcut.register("CommandOrControl+Shift+T", () => {
-    toggleOverlay();
-  });
-
+  globalShortcut.register("CommandOrControl+Shift+T", () => toggleOverlay());
   globalShortcut.register("CommandOrControl+Shift+P", () => {
     if (isPipelineRunning) {
       stopPipelines();
       return;
     }
-
-    startPipelines();
+    void startPipelines();
   });
-
-  globalShortcut.register("CommandOrControl+Shift+K", () => {
-    clearUtterances();
-  });
+  globalShortcut.register("CommandOrControl+Shift+K", () => clearUtterances());
 };
+
+// ── Auth ──
 
 const signInWithPassword = async (
   input: AuthSignInInput,
@@ -669,7 +524,36 @@ const signInWithPassword = async (
 
   applySession(data.session ?? null, data.user ?? null);
   authError = null;
-  proxyClient.setCredentials({ token: authAccessToken });
+  return authSnapshot();
+};
+
+const signUpWithPassword = async (
+  input: AuthSignInInput,
+): Promise<AuthSnapshot> => {
+  authStatus = "signing_in";
+  authError = null;
+  emitSnapshot();
+
+  const { data, error } = await supabase.auth.signUp({
+    email: input.email,
+    password: input.password,
+  });
+
+  if (error) {
+    authStatus = "signed_out";
+    authError = error.message;
+    authAccessToken = null;
+    emitSnapshot();
+    throw new Error(error.message);
+  }
+
+  if (data.session) {
+    applySession(data.session, data.user ?? null);
+  } else {
+    authStatus = "signed_out";
+    authError = "Check your email to confirm your account.";
+    emitSnapshot();
+  }
 
   return authSnapshot();
 };
@@ -684,8 +568,6 @@ const signOut = async (): Promise<AuthSnapshot> => {
 
   applySession(null, null);
   authError = null;
-  proxyClient.setCredentials({ token: null });
-
   return authSnapshot();
 };
 
@@ -695,22 +577,52 @@ const getAuthSnapshot = async (): Promise<AuthSnapshot> => {
   return authSnapshot();
 };
 
+// ── Settings ──
+
+const getSettings = (): AppSettings => appSettings;
+
+const updateTokenServiceUrl = (url: string): AppSettings => {
+  const normalized = url.trim();
+  if (!normalized) throw new Error("Token service URL cannot be empty");
+
+  appSettings = { ...appSettings, tokenServiceUrl: normalized };
+  writeSetting("tokenServiceUrl", normalized);
+  sessionManager.updateConfig({ tokenServiceUrl: normalized });
+  emitSnapshot();
+  return appSettings;
+};
+
+const updateLanguage = (language: LanguageSettings): AppSettings => {
+  const normalized: LanguageSettings = {
+    youSource: "auto",
+    youTarget: language.youTarget.trim(),
+    themSource: "auto",
+    themTarget: language.themTarget.trim(),
+  };
+
+  if (!normalized.youTarget || !normalized.themTarget) {
+    throw new Error("Target language fields are required");
+  }
+
+  appSettings = { ...appSettings, language: normalized };
+  writeSetting("language", normalized);
+  sessionManager.updateConfig({
+    language: normalized as GeminiLanguageSettings,
+  });
+  emitSnapshot();
+  return appSettings;
+};
+
+// ── IPC Handlers ──
+
 const registerIpcHandlers = (): void => {
   ipcMain.handle("overlay:toggle", () => toggleOverlay());
-
   ipcMain.handle("overlay:get-bounds", () => {
-    if (!overlayWindow) {
-      throw new Error("Overlay window is not initialized");
-    }
-
+    if (!overlayWindow) throw new Error("Overlay window is not initialized");
     return toOverlayBounds(overlayWindow);
   });
-
   ipcMain.handle("overlay:set-bounds", (_event, bounds: OverlayBounds) => {
-    if (!overlayWindow) {
-      throw new Error("Overlay window is not initialized");
-    }
-
+    if (!overlayWindow) throw new Error("Overlay window is not initialized");
     overlayWindow.setBounds(bounds);
   });
 
@@ -722,21 +634,48 @@ const registerIpcHandlers = (): void => {
   ipcMain.handle("auth:sign-in", (_event, input: AuthSignInInput) =>
     signInWithPassword(input),
   );
+  ipcMain.handle("auth:sign-up", (_event, input: AuthSignInInput) =>
+    signUpWithPassword(input),
+  );
   ipcMain.handle("auth:sign-out", () => signOut());
   ipcMain.handle("auth:get", () => getAuthSnapshot());
+
+  ipcMain.handle("settings:get", () => getSettings());
+  ipcMain.handle(
+    "settings:update-token-service-url",
+    (_event, url: string) => updateTokenServiceUrl(url),
+  );
+  ipcMain.handle(
+    "settings:update-language",
+    (_event, language: LanguageSettings) => updateLanguage(language),
+  );
+
+  ipcMain.handle("audio:mic-chunk", (_event, base64Pcm: string) => {
+    sessionManager.pushMicAudio(base64Pcm);
+  });
+
+  ipcMain.handle("audio:system-chunk", (_event, base64Pcm: string) => {
+    sessionManager.pushSystemAudio(base64Pcm);
+  });
+
+  ipcMain.handle("usage:reset", () => sessionManager.resetUsage());
 };
+
+// ── Meeting Detection ──
 
 const processList = (): string[] => {
   try {
     if (process.platform === "win32") {
-      const stdout = execSync("tasklist", { encoding: "utf-8" });
+      const stdout = execFileSync("tasklist", [], { encoding: "utf-8" });
       return stdout
         .split("\n")
         .map((line) => line.trim().toLowerCase())
         .filter(Boolean);
     }
 
-    const stdout = execSync("ps -A -o comm=", { encoding: "utf-8" });
+    const stdout = execFileSync("ps", ["-A", "-o", "comm="], {
+      encoding: "utf-8",
+    });
     return stdout
       .split("\n")
       .map((line) => path.basename(line.trim()).toLowerCase())
@@ -753,10 +692,8 @@ const readRuntimeSignals = () => {
     MEETING_PROCESS_HINTS.some((hint) => processName.includes(hint)),
   );
 
-  const browserUrlMatched = meetingProcessActive;
-
   return {
-    browserUrlMatched,
+    browserUrlMatched: meetingProcessActive,
     meetingProcessActive,
     microphoneInUse: isPipelineRunning,
     systemSpeechDetected: Date.now() - lastSpeechAt < 6000,
@@ -770,14 +707,22 @@ const meetingOrchestrator = new MeetingOrchestrator({
     emitSnapshot();
   },
   onAutoStart: () => {
-    startPipelines();
+    void startPipelines();
   },
   onAutoStop: () => {
     stopPipelines();
   },
 });
 
+// ── App Lifecycle ──
+
 app.on("ready", async () => {
+  appSettings = readSettings();
+  sessionManager.updateConfig({
+    tokenServiceUrl: appSettings.tokenServiceUrl,
+    language: appSettings.language as GeminiLanguageSettings,
+  });
+
   overlayWindow = createOverlayWindow();
   registerIpcHandlers();
   createTray();
@@ -788,10 +733,6 @@ app.on("ready", async () => {
 
   supabase.auth.onAuthStateChange((_event, session) => {
     applySession(session ?? null, session?.user ?? null);
-
-    proxyClient.setCredentials({
-      token: session?.access_token ?? null,
-    });
   });
 
   meetingOrchestrator.start();
@@ -817,8 +758,11 @@ app.on("activate", () => {
 });
 
 app.on("will-quit", () => {
-  clearPipelineTimers();
+  if (systemAudioCapture) {
+    systemAudioCapture.stop();
+    systemAudioCapture = null;
+  }
+  sessionManager.dispose();
   meetingOrchestrator.stop();
-  proxyClient.dispose();
   globalShortcut.unregisterAll();
 });

@@ -1,719 +1,420 @@
-import { Hono } from 'hono';
-import { createRemoteJWKSet, jwtVerify, type JWTPayload } from 'jose';
+import { Hono } from "hono";
+import { cors } from "hono/cors";
+import { createRemoteJWKSet, jwtVerify, type JWTPayload } from "jose";
+import { GoogleGenAI, Modality } from "@google/genai";
+import { z } from "zod";
 import {
-	RATE_LIMITS,
-	SESSION_LIMITS,
-	type ClientMessage,
-	type ServerMessage,
-} from '@realtime/shared';
-import { z } from 'zod';
+  SESSION_LIMITS,
+  GEMINI_MODELS,
+  type TokenResponse,
+  type TokenError,
+} from "@realtime/shared";
+
+// ── Environment ──
 
 interface Env {
-	MY_DURABLE_OBJECT: DurableObjectNamespace;
-	SUPABASE_URL: string;
-	SUPABASE_JWT_AUDIENCE?: string;
-	SUPABASE_JWT_ISSUER?: string;
-	ALLOW_LEGACY_DEV_JWT?: string;
-	JWT_SECRET?: string;
-	GEMINI_API_KEY?: string;
+  USAGE_TRACKER: DurableObjectNamespace;
+  SUPABASE_URL: string;
+  SUPABASE_JWT_AUDIENCE?: string;
+  SUPABASE_JWT_ISSUER?: string;
+  GEMINI_API_KEY: string;
 }
 
-interface SessionState {
-	activeSince: number | null;
-	activeMsToday: number;
-	requestsInCurrentMinute: number;
-	concurrentRequests: number;
-	currentMinuteKey: string;
+// ── Durable Object: Per-User Usage Tracking ──
+
+interface UsageState {
+  tokensIssuedToday: number;
+  tokensIssuedThisHour: number;
+  currentDayKey: string;
+  currentHourKey: string;
+  estimatedActiveMs: number;
 }
 
-interface AuthSession {
-	userId: string;
-	deviceId: string;
-	sessionId: string;
+const dayKey = (date: Date): string => {
+  return `${date.getUTCFullYear()}-${String(date.getUTCMonth() + 1).padStart(2, "0")}-${String(date.getUTCDate()).padStart(2, "0")}`;
+};
+
+const hourKey = (date: Date): string => {
+  return `${dayKey(date)}-${String(date.getUTCHours()).padStart(2, "0")}`;
+};
+
+const defaultUsageState = (): UsageState => {
+  const now = new Date();
+  return {
+    tokensIssuedToday: 0,
+    tokensIssuedThisHour: 0,
+    currentDayKey: dayKey(now),
+    currentHourKey: hourKey(now),
+    estimatedActiveMs: 0,
+  };
+};
+
+export class UsageTracker {
+  private readonly state: DurableObjectState;
+  private usage: UsageState = defaultUsageState();
+  private initialized = false;
+
+  constructor(state: DurableObjectState) {
+    this.state = state;
+  }
+
+  private async init(): Promise<void> {
+    if (this.initialized) return;
+    const stored = await this.state.storage.get<UsageState>("usage");
+    if (stored) {
+      this.usage = stored;
+    }
+    this.initialized = true;
+  }
+
+  private rotateWindows(now: Date): void {
+    const dk = dayKey(now);
+    if (this.usage.currentDayKey !== dk) {
+      this.usage.currentDayKey = dk;
+      this.usage.tokensIssuedToday = 0;
+      this.usage.estimatedActiveMs = 0;
+    }
+
+    const hk = hourKey(now);
+    if (this.usage.currentHourKey !== hk) {
+      this.usage.currentHourKey = hk;
+      this.usage.tokensIssuedThisHour = 0;
+    }
+  }
+
+  async fetch(request: Request): Promise<Response> {
+    await this.init();
+
+    const url = new URL(request.url);
+
+    if (url.pathname === "/check-and-increment") {
+      const now = new Date();
+      this.rotateWindows(now);
+
+      if (
+        this.usage.tokensIssuedThisHour >=
+        SESSION_LIMITS.maxTokensPerUserPerHour
+      ) {
+        return Response.json(
+          {
+            allowed: false,
+            reason: "rate_limited",
+            retryAfterMs: 60_000,
+          },
+          { status: 429 },
+        );
+      }
+
+      if (this.usage.estimatedActiveMs >= SESSION_LIMITS.dailySessionMs) {
+        return Response.json(
+          {
+            allowed: false,
+            reason: "usage_exhausted",
+          },
+          { status: 429 },
+        );
+      }
+
+      this.usage.tokensIssuedToday += 1;
+      this.usage.tokensIssuedThisHour += 1;
+      // Don't pre-charge session time — actual usage is reported via /report-usage
+      await this.state.storage.put("usage", this.usage);
+
+      const dailyRemainingMs = Math.max(
+        0,
+        SESSION_LIMITS.dailySessionMs - this.usage.estimatedActiveMs,
+      );
+
+      return Response.json({
+        allowed: true,
+        dailyRemainingMs,
+        tokensGeneratedToday: this.usage.tokensIssuedToday,
+      });
+    }
+
+    if (url.pathname === "/report-usage") {
+      const body = (await request.json().catch(() => ({}))) as {
+        durationMs?: number;
+      };
+      const durationMs = body.durationMs;
+      if (typeof durationMs === "number" && durationMs > 0) {
+        this.rotateWindows(new Date());
+        this.usage.estimatedActiveMs += durationMs;
+        await this.state.storage.put("usage", this.usage);
+      }
+
+      return Response.json({
+        ok: true,
+        estimatedActiveMs: this.usage.estimatedActiveMs,
+        dailyRemainingMs: Math.max(
+          0,
+          SESSION_LIMITS.dailySessionMs - this.usage.estimatedActiveMs,
+        ),
+      });
+    }
+
+    if (url.pathname === "/reset") {
+      this.usage = defaultUsageState();
+      await this.state.storage.put("usage", this.usage);
+      return Response.json({ ok: true, usage: this.usage });
+    }
+
+    if (url.pathname === "/status") {
+      const now = new Date();
+      this.rotateWindows(now);
+
+      return Response.json({
+        tokensIssuedToday: this.usage.tokensIssuedToday,
+        tokensIssuedThisHour: this.usage.tokensIssuedThisHour,
+        estimatedActiveMs: this.usage.estimatedActiveMs,
+        dailyRemainingMs: Math.max(
+          0,
+          SESSION_LIMITS.dailySessionMs - this.usage.estimatedActiveMs,
+        ),
+      });
+    }
+
+    return new Response("Not found", { status: 404 });
+  }
 }
 
-interface DurableEnvelope {
-	messages: ServerMessage[];
-}
+// ── JWT Verification ──
 
-const SUPPORTED_LANGUAGES = new Set([
-	'en-US',
-	'hi-IN',
-	'es-ES',
-	'fr-FR',
-	'de-DE',
-	'it-IT',
-	'pt-BR',
-	'ru-RU',
-	'ja-JP',
-	'ko-KR',
-	'zh-CN',
-	'ar-SA',
-]);
+let cachedJWKS: ReturnType<typeof createRemoteJWKSet> | null = null;
 
-const authSchema = z.object({
-	type: z.literal('auth'),
-	token: z.string().min(1),
-	deviceId: z.string().min(1),
+const getJWKS = (env: Env): ReturnType<typeof createRemoteJWKSet> => {
+  if (!cachedJWKS) {
+    cachedJWKS = createRemoteJWKSet(
+      new URL(`${env.SUPABASE_URL}/auth/v1/.well-known/jwks.json`),
+    );
+  }
+  return cachedJWKS;
+};
+
+const verifySupabaseToken = async (
+  token: string,
+  env: Env,
+): Promise<{ sub: string } | null> => {
+  try {
+    const issuer =
+      env.SUPABASE_JWT_ISSUER || `${env.SUPABASE_URL}/auth/v1`;
+    const audience = env.SUPABASE_JWT_AUDIENCE || "authenticated";
+
+    const { payload } = await jwtVerify(token, getJWKS(env), {
+      issuer,
+      audience,
+    });
+
+    if (typeof payload.sub !== "string") return null;
+    return { sub: payload.sub };
+  } catch {
+    return null;
+  }
+};
+
+// ── Gemini Ephemeral Token Generation ──
+
+const generateEphemeralToken = async (
+  apiKey: string,
+  model: string,
+): Promise<{ token: string; expiresAt: string } | null> => {
+  const expireTime = new Date(
+    Date.now() + SESSION_LIMITS.tokenLifetimeMs,
+  ).toISOString();
+
+  try {
+    const client = new GoogleGenAI({ apiKey });
+
+    const token = await client.authTokens.create({
+      config: {
+        uses: 10,
+        expireTime,
+        newSessionExpireTime: new Date(
+          Date.now() + 2 * 60 * 1000,
+        ).toISOString(),
+        httpOptions: {
+          apiVersion: "v1alpha",
+        },
+      },
+    });
+
+    const tokenName = token?.name;
+    if (!tokenName) {
+      console.error(
+        "Ephemeral token response missing name:",
+        JSON.stringify(token),
+      );
+      return null;
+    }
+
+    return {
+      token: tokenName,
+      expiresAt: (token as { expireTime?: string }).expireTime ?? expireTime,
+    };
+  } catch (err) {
+    console.error(
+      "Ephemeral token generation failed:",
+      err instanceof Error ? err.message : err,
+    );
+    return null;
+  }
+};
+
+// ── Request Validation ──
+
+const tokenRequestSchema = z.object({
+  model: z.string().optional(),
 });
 
-const translateSchema = z.object({
-	type: z.literal('translate'),
-	utteranceId: z.string().min(1),
-	text: z.string().min(1).max(SESSION_LIMITS.maxCharsPerRequest),
-	sourceLang: z.string().min(2),
-	targetLang: z.string().min(2),
-	speaker: z.enum(['you', 'them']),
-});
-
-const pingSchema = z.object({
-	type: z.literal('ping'),
-	sentAt: z.number(),
-});
-
-const disconnectSchema = z.object({
-	type: z.literal('disconnect'),
-	reason: z.enum(['meeting_ended', 'user_stopped', 'shutdown']),
-});
-
-const clientMessageSchema = z.discriminatedUnion('type', [
-	authSchema,
-	translateSchema,
-	pingSchema,
-	disconnectSchema,
-]);
-
-const parseClientMessage = (raw: string): ClientMessage | null => {
-	try {
-		const parsedJson = JSON.parse(raw);
-		const parsed = clientMessageSchema.safeParse(parsedJson);
-		return parsed.success ? parsed.data : null;
-	} catch {
-		return null;
-	}
-};
-
-const minuteKey = (date: Date): string => {
-	const yyyy = date.getUTCFullYear();
-	const mm = `${date.getUTCMonth() + 1}`.padStart(2, '0');
-	const dd = `${date.getUTCDate()}`.padStart(2, '0');
-	const hh = `${date.getUTCHours()}`.padStart(2, '0');
-	const min = `${date.getUTCMinutes()}`.padStart(2, '0');
-	return `${yyyy}${mm}${dd}${hh}${min}`;
-};
-
-const defaultState = (): SessionState => ({
-	activeSince: null,
-	activeMsToday: 0,
-	requestsInCurrentMinute: 0,
-	concurrentRequests: 0,
-	currentMinuteKey: minuteKey(new Date()),
-});
-
-const encodeEnvelope = (messages: ServerMessage[]): string =>
-	JSON.stringify({ messages } satisfies DurableEnvelope);
-
-const parseEnvelope = (raw: string): DurableEnvelope | null => {
-	try {
-		const parsed: unknown = JSON.parse(raw);
-		if (
-			typeof parsed !== 'object' ||
-			parsed === null ||
-			!('messages' in parsed) ||
-			!Array.isArray((parsed as { messages: unknown }).messages)
-		) {
-			return null;
-		}
-
-		return parsed as DurableEnvelope;
-	} catch {
-		return null;
-	}
-};
-
-const buildTranslationPrompt = (
-	text: string,
-	sourceLang: string,
-	targetLang: string,
-): string => {
-	return `Translate from ${sourceLang} to ${targetLang}. Output ONLY the translation. Text: ${text}`;
-};
-
-const parseClaims = (payload: JWTPayload): { sub: string } | null => {
-	const sub = payload.sub;
-
-	if (typeof sub !== 'string') {
-		return null;
-	}
-
-	return { sub };
-};
-
-const isLanguageSupported = (language: string): boolean =>
-	SUPPORTED_LANGUAGES.has(language);
-
-const isSuspiciousPromptInjection = (text: string): boolean => {
-	return /ignore\s+previous|system\s+prompt|developer\s+instruction/i.test(text);
-};
-
-const sanitizeText = (text: string): string => {
-	return text
-		.replace(/[`*_#[\]{}<>]/g, ' ')
-		.replace(/\s+/g, ' ')
-		.trim();
-};
-
-const toPrimaryHttpMessage = (messages: ServerMessage[]): ServerMessage => {
-	for (let index = messages.length - 1; index >= 0; index -= 1) {
-		const message = messages[index];
-		if (!message) {
-			continue;
-		}
-
-		if (
-			message.type !== 'rate_warning' &&
-			message.type !== 'session_warning' &&
-			message.type !== 'pong'
-		) {
-			return message;
-		}
-	}
-
-	return {
-		type: 'error',
-		code: 'invalid_payload',
-		message: 'No proxy message returned',
-	};
-};
-
-const parseBooleanFlag = (value: string | undefined): boolean => {
-	if (!value) {
-		return false;
-	}
-
-	return value.toLowerCase() === 'true' || value === '1';
-};
-
-export class MyDurableObject {
-	private readonly state: DurableObjectState;
-	private readonly env: Env;
-	private readonly sessions = new Map<string, SessionState>();
-	private readonly authByConnection = new Map<string, AuthSession>();
-	private readonly supabaseJWKS: ReturnType<typeof createRemoteJWKSet>;
-	private readonly supabaseIssuer: string;
-	private readonly supabaseAudience: string;
-	private readonly allowLegacyDevJWT: boolean;
-
-	constructor(state: DurableObjectState, env: Env) {
-		this.state = state;
-		this.env = env;
-
-		this.supabaseIssuer =
-			env.SUPABASE_JWT_ISSUER || `${env.SUPABASE_URL}/auth/v1`;
-		this.supabaseAudience = env.SUPABASE_JWT_AUDIENCE || 'authenticated';
-		this.supabaseJWKS = createRemoteJWKSet(
-			new URL(`${env.SUPABASE_URL}/auth/v1/.well-known/jwks.json`),
-		);
-		this.allowLegacyDevJWT = parseBooleanFlag(env.ALLOW_LEGACY_DEV_JWT);
-	}
-
-	private getSession(userId: string): SessionState {
-		const existing = this.sessions.get(userId);
-		if (existing) {
-			return existing;
-		}
-
-		const created = defaultState();
-		this.sessions.set(userId, created);
-		return created;
-	}
-
-	private rotateMinuteWindow(session: SessionState, now: Date): void {
-		const key = minuteKey(now);
-		if (session.currentMinuteKey !== key) {
-			session.currentMinuteKey = key;
-			session.requestsInCurrentMinute = 0;
-		}
-	}
-
-	private trackActiveUsage(session: SessionState, nowMs: number): void {
-		if (session.activeSince === null) {
-			session.activeSince = nowMs;
-			return;
-		}
-
-		const gap = nowMs - session.activeSince;
-		if (gap <= SESSION_LIMITS.idleGapMs) {
-			session.activeMsToday += gap;
-		}
-
-		session.activeSince = nowMs;
-	}
-
-	private getAuth(connectionId: string): AuthSession | null {
-		const auth = this.authByConnection.get(connectionId);
-		return auth ?? null;
-	}
-
-	private async verifyTokenClaims(
-		token: string,
-	): Promise<{ sub: string } | null> {
-		try {
-			const verified = await jwtVerify(token, this.supabaseJWKS, {
-				issuer: this.supabaseIssuer,
-				audience: this.supabaseAudience,
-			});
-			return parseClaims(verified.payload);
-		} catch {
-			if (!this.allowLegacyDevJWT || !this.env.JWT_SECRET) {
-				return null;
-			}
-
-			try {
-				const secret = new TextEncoder().encode(this.env.JWT_SECRET);
-				const verified = await jwtVerify(token, secret);
-				return parseClaims(verified.payload);
-			} catch {
-				return null;
-			}
-		}
-	}
-
-	private async handleAuth(
-		connectionId: string,
-		message: Extract<ClientMessage, { type: 'auth' }>,
-	): Promise<ServerMessage[]> {
-		const claims = await this.verifyTokenClaims(message.token);
-
-		if (!claims) {
-			return [
-				{
-					type: 'error',
-					code: 'unauthorized',
-					message: 'Token verification failed',
-				},
-			];
-		}
-
-		const sessionId = `${claims.sub}-${Date.now()}`;
-		this.authByConnection.set(connectionId, {
-			userId: claims.sub,
-			deviceId: message.deviceId,
-			sessionId,
-		});
-
-		const session = this.getSession(claims.sub);
-		const remainingMs = Math.max(
-			0,
-			SESSION_LIMITS.dailySessionMs - session.activeMsToday,
-		);
-
-		return [
-			{
-				type: 'auth_ok',
-				sessionId,
-				dailyRemainingMs: remainingMs,
-				rpmRemaining: Math.max(
-					0,
-					RATE_LIMITS.perUserRequestsPerMinute -
-						session.requestsInCurrentMinute,
-				),
-			},
-		];
-	}
-
-	private async handleTranslate(
-		connectionId: string,
-		message: Extract<ClientMessage, { type: 'translate' }>,
-	): Promise<ServerMessage[]> {
-		const auth = this.getAuth(connectionId);
-		if (!auth) {
-			return [
-				{
-					type: 'error',
-					code: 'session_required',
-					message: 'Authenticate before translate requests',
-					utteranceId: message.utteranceId,
-				},
-			];
-		}
-
-		if (
-			!isLanguageSupported(message.sourceLang) ||
-			!isLanguageSupported(message.targetLang)
-		) {
-			return [
-				{
-					type: 'error',
-					code: 'invalid_language',
-					message: 'Unsupported language pair',
-					utteranceId: message.utteranceId,
-				},
-			];
-		}
-
-		if (message.text.length > SESSION_LIMITS.maxCharsPerRequest) {
-			return [
-				{
-					type: 'error',
-					code: 'text_too_long',
-					message: `Text exceeds max length ${SESSION_LIMITS.maxCharsPerRequest}`,
-					utteranceId: message.utteranceId,
-				},
-			];
-		}
-
-		if (isSuspiciousPromptInjection(message.text)) {
-			return [
-				{
-					type: 'error',
-					code: 'invalid_payload',
-					message: 'Input contains blocked instruction-like patterns',
-					utteranceId: message.utteranceId,
-				},
-			];
-		}
-
-		const session = this.getSession(auth.userId);
-		const now = new Date();
-
-		this.rotateMinuteWindow(session, now);
-		this.trackActiveUsage(session, now.getTime());
-
-		if (session.activeMsToday >= SESSION_LIMITS.dailySessionMs) {
-			return [
-				{
-					type: 'session_expired',
-					resetAtUtc: '00:00:00Z',
-				},
-			];
-		}
-
-		if (session.concurrentRequests >= RATE_LIMITS.perUserConcurrentRequests) {
-			return [
-				{
-					type: 'rate_limited',
-					retryAfterMs: 1000,
-					utteranceId: message.utteranceId,
-				},
-			];
-		}
-
-		if (
-			session.requestsInCurrentMinute >= RATE_LIMITS.perUserRequestsPerMinute
-		) {
-			return [
-				{
-					type: 'rate_limited',
-					retryAfterMs: 1000,
-					utteranceId: message.utteranceId,
-				},
-			];
-		}
-
-		session.requestsInCurrentMinute += 1;
-		session.concurrentRequests += 1;
-
-		const messages: ServerMessage[] = [];
-
-		const remainingRpm =
-			RATE_LIMITS.perUserRequestsPerMinute - session.requestsInCurrentMinute;
-		if (
-			remainingRpm <=
-			Math.floor(
-				RATE_LIMITS.perUserRequestsPerMinute *
-					(1 - SESSION_LIMITS.warningThresholdRatio),
-			)
-		) {
-			messages.push({
-				type: 'rate_warning',
-				remaining: Math.max(0, remainingRpm),
-				limit: RATE_LIMITS.perUserRequestsPerMinute,
-			});
-		}
-
-		const remainingDailyMs = Math.max(
-			0,
-			SESSION_LIMITS.dailySessionMs - session.activeMsToday,
-		);
-		if (
-			remainingDailyMs <=
-			SESSION_LIMITS.dailySessionMs * (1 - SESSION_LIMITS.warningThresholdRatio)
-		) {
-			messages.push({
-				type: 'session_warning',
-				dailyRemainingMs: remainingDailyMs,
-			});
-		}
-
-		const sanitizedText = sanitizeText(message.text);
-
-		try {
-			if (!this.env.GEMINI_API_KEY) {
-				messages.push({
-					type: 'translation_chunk',
-					utteranceId: message.utteranceId,
-					chunk: `[${message.targetLang}] ${sanitizedText}`,
-					done: true,
-				});
-				return messages;
-			}
-
-			const response = await fetch(
-				'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent',
-				{
-					method: 'POST',
-					headers: {
-						'content-type': 'application/json',
-						'x-goog-api-key': this.env.GEMINI_API_KEY,
-					},
-					body: JSON.stringify({
-						contents: [
-							{
-								role: 'user',
-								parts: [
-									{
-										text: buildTranslationPrompt(
-											sanitizedText,
-											message.sourceLang,
-											message.targetLang,
-										),
-									},
-								],
-							},
-						],
-						generationConfig: {
-							temperature: 0,
-						},
-					}),
-				},
-			);
-
-			if (!response.ok) {
-				messages.push({
-					type: 'error',
-					code: 'translation_failed',
-					message: `Gemini request failed with status ${response.status}`,
-					utteranceId: message.utteranceId,
-				});
-				return messages;
-			}
-
-			const payload: unknown = await response.json();
-			const candidates =
-				typeof payload === 'object' &&
-				payload !== null &&
-				'candidates' in payload &&
-				Array.isArray((payload as { candidates: unknown }).candidates)
-					? (payload as {
-							candidates: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
-					  }).candidates
-					: [];
-
-			const translation = candidates[0]?.content?.parts?.[0]?.text ?? '';
-			if (!translation) {
-				messages.push({
-					type: 'error',
-					code: 'translation_failed',
-					message: 'Gemini returned an empty translation',
-					utteranceId: message.utteranceId,
-				});
-				return messages;
-			}
-
-			messages.push({
-				type: 'translation_chunk',
-				utteranceId: message.utteranceId,
-				chunk: translation.trim(),
-				done: true,
-			});
-			return messages;
-		} catch (error) {
-			messages.push({
-				type: 'error',
-				code: 'translation_failed',
-				message:
-					error instanceof Error ? error.message : 'Translation request failed',
-				utteranceId: message.utteranceId,
-			});
-			return messages;
-		} finally {
-			session.concurrentRequests = Math.max(0, session.concurrentRequests - 1);
-		}
-	}
-
-	private async processRawMessage(
-		connectionId: string,
-		raw: string,
-	): Promise<ServerMessage[]> {
-		const message = parseClientMessage(raw);
-
-		if (!message) {
-			return [
-				{
-					type: 'error',
-					code: 'invalid_payload',
-					message: 'Client message validation failed',
-				},
-			];
-		}
-
-		switch (message.type) {
-			case 'ping':
-				return [
-					{
-						type: 'pong',
-						sentAt: message.sentAt,
-					},
-				];
-			case 'disconnect':
-				this.authByConnection.delete(connectionId);
-				return [
-					{
-						type: 'pong',
-						sentAt: Date.now(),
-					},
-				];
-			case 'auth':
-				return this.handleAuth(connectionId, message);
-			case 'translate':
-				return this.handleTranslate(connectionId, message);
-			default:
-				return [
-					{
-						type: 'error',
-						code: 'invalid_payload',
-						message: 'Unsupported message type',
-					},
-				];
-		}
-	}
-
-	async fetch(request: Request): Promise<Response> {
-		const raw = await request.text();
-		const connectionId = request.headers.get('x-connection-id') ?? 'unknown';
-		const messages = await this.processRawMessage(connectionId, raw);
-
-		return new Response(encodeEnvelope(messages), {
-			headers: {
-				'content-type': 'application/json',
-			},
-		});
-	}
-}
+// ── Hono App ──
 
 const app = new Hono<{ Bindings: Env }>();
 
-const getDurableStub = (env: Env): DurableObjectStub => {
-	const id = env.MY_DURABLE_OBJECT.idFromName('session');
-	return env.MY_DURABLE_OBJECT.get(id);
-};
+app.use("*", cors());
 
-app.get('/health', (context) => {
-	return context.json({ ok: true });
+app.get("/health", (c) => {
+  return c.json({ ok: true, service: "realtime-translate-token-service" });
 });
 
-app.post('/message', async (context) => {
-	const stub = getDurableStub(context.env);
-	const body = await context.req.text();
+app.post("/api/report-usage", async (c) => {
+  const authHeader = c.req.header("Authorization");
+  if (!authHeader?.startsWith("Bearer ")) {
+    return c.json({ code: "unauthorized", message: "Missing Authorization" } satisfies TokenError, 401);
+  }
 
-	const response = await stub.fetch('https://do/message', {
-		method: 'POST',
-		headers: {
-			'x-connection-id': 'http-legacy',
-		},
-		body,
-	});
+  const claims = await verifySupabaseToken(authHeader.slice(7), c.env);
+  if (!claims) {
+    return c.json({ code: "unauthorized", message: "Token verification failed" } satisfies TokenError, 401);
+  }
 
-	const text = await response.text();
-	const envelope = parseEnvelope(text);
-	if (!envelope || envelope.messages.length === 0) {
-		return context.json(
-			{
-				type: 'error',
-				code: 'invalid_payload',
-				message: 'Proxy returned empty response',
-			} satisfies ServerMessage,
-			500,
-		);
-	}
-
-	return context.json(toPrimaryHttpMessage(envelope.messages));
+  const body = await c.req.json().catch(() => ({}));
+  const doId = c.env.USAGE_TRACKER.idFromName(claims.sub);
+  const stub = c.env.USAGE_TRACKER.get(doId);
+  const res = await stub.fetch(
+    new Request("https://do/report-usage", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }),
+  );
+  return c.json(await res.json());
 });
 
-app.get('/ws', async (context) => {
-	const upgrade = context.req.header('Upgrade');
+app.post("/api/reset-usage", async (c) => {
+  const authHeader = c.req.header("Authorization");
+  if (!authHeader?.startsWith("Bearer ")) {
+    return c.json({ code: "unauthorized", message: "Missing Authorization" } satisfies TokenError, 401);
+  }
 
-	if (!upgrade || upgrade.toLowerCase() !== 'websocket') {
-		return new Response('Expected websocket upgrade', { status: 426 });
-	}
+  const claims = await verifySupabaseToken(authHeader.slice(7), c.env);
+  if (!claims) {
+    return c.json({ code: "unauthorized", message: "Token verification failed" } satisfies TokenError, 401);
+  }
 
-	const pair = new WebSocketPair();
-	const client = pair[0];
-	const server = pair[1];
-	const connectionId = crypto.randomUUID();
+  const doId = c.env.USAGE_TRACKER.idFromName(claims.sub);
+  const stub = c.env.USAGE_TRACKER.get(doId);
+  const res = await stub.fetch(new Request("https://do/reset", { method: "POST" }));
+  return c.json(await res.json());
+});
 
-	const stub = getDurableStub(context.env);
-	server.accept();
+app.post("/api/token", async (c) => {
+  // Extract and verify Supabase JWT
+  const authHeader = c.req.header("Authorization");
+  if (!authHeader?.startsWith("Bearer ")) {
+    return c.json(
+      {
+        code: "unauthorized",
+        message: "Missing or invalid Authorization header",
+      } satisfies TokenError,
+      401,
+    );
+  }
 
-	server.addEventListener('message', async (event: MessageEvent) => {
-		if (typeof event.data !== 'string') {
-			server.send(
-				JSON.stringify({
-					type: 'error',
-					code: 'invalid_payload',
-					message: 'Only string payloads are supported',
-				} satisfies ServerMessage),
-			);
-			return;
-		}
+  const jwt = authHeader.slice(7);
+  const claims = await verifySupabaseToken(jwt, c.env);
+  if (!claims) {
+    return c.json(
+      {
+        code: "unauthorized",
+        message: "Token verification failed",
+      } satisfies TokenError,
+      401,
+    );
+  }
 
-		const response = await stub.fetch('https://do/message', {
-			method: 'POST',
-			headers: {
-				'x-connection-id': connectionId,
-			},
-			body: event.data,
-		});
+  // Parse request body
+  const body = await c.req.json().catch(() => ({}));
+  const parsed = tokenRequestSchema.safeParse(body);
+  if (!parsed.success) {
+    return c.json(
+      {
+        code: "invalid_request",
+        message: "Invalid request body",
+      } satisfies TokenError,
+      400,
+    );
+  }
 
-		const text = await response.text();
-		const envelope = parseEnvelope(text);
+  const model = parsed.data.model ?? GEMINI_MODELS.live;
 
-		if (!envelope || envelope.messages.length === 0) {
-			server.send(
-				JSON.stringify({
-					type: 'error',
-					code: 'invalid_payload',
-					message: 'Proxy returned empty response',
-				} satisfies ServerMessage),
-			);
-			return;
-		}
+  // Check usage limits via Durable Object
+  const doId = c.env.USAGE_TRACKER.idFromName(claims.sub);
+  const stub = c.env.USAGE_TRACKER.get(doId);
+  const usageResponse = await stub.fetch(
+    new Request("https://do/check-and-increment", { method: "POST" }),
+  );
 
-		envelope.messages.forEach((message) => {
-			server.send(JSON.stringify(message));
-		});
-	});
+  if (!usageResponse.ok) {
+    const usageData = (await usageResponse.json()) as {
+      reason: string;
+      retryAfterMs?: number;
+    };
 
-	server.addEventListener('close', async () => {
-		await stub.fetch('https://do/message', {
-			method: 'POST',
-			headers: {
-				'x-connection-id': connectionId,
-			},
-			body: JSON.stringify({
-				type: 'disconnect',
-				reason: 'shutdown',
-			} satisfies ClientMessage),
-		});
-	});
+    if (usageData.reason === "rate_limited") {
+      return c.json(
+        {
+          code: "rate_limited",
+          message: "Too many token requests. Please wait before trying again.",
+          retryAfterMs: usageData.retryAfterMs,
+        } satisfies TokenError,
+        429,
+      );
+    }
 
-	return new Response(null, {
-		status: 101,
-		webSocket: client,
-	});
+    return c.json(
+      {
+        code: "usage_exhausted",
+        message: "Daily usage limit reached. Resets at midnight UTC.",
+      } satisfies TokenError,
+      429,
+    );
+  }
+
+  const usageData = (await usageResponse.json()) as {
+    dailyRemainingMs: number;
+    tokensGeneratedToday: number;
+  };
+
+  // Generate Gemini ephemeral token
+  const ephemeral = await generateEphemeralToken(c.env.GEMINI_API_KEY, model);
+  if (!ephemeral) {
+    return c.json(
+      {
+        code: "token_generation_failed",
+        message: "Failed to generate Gemini ephemeral token",
+      } satisfies TokenError,
+      502,
+    );
+  }
+
+  return c.json({
+    token: ephemeral.token,
+    expiresAt: ephemeral.expiresAt,
+    dailyRemainingMs: usageData.dailyRemainingMs,
+    tokensGeneratedToday: usageData.tokensGeneratedToday,
+  } satisfies TokenResponse);
 });
 
 export default {
-	fetch: app.fetch,
+  fetch: app.fetch,
 } satisfies ExportedHandler<Env>;

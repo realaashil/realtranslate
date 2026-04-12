@@ -8,18 +8,13 @@ interface OverlayBounds {
 }
 
 type Speaker = "you" | "them";
-type UtteranceStatus =
-  | "listening"
-  | "transcribing"
-  | "translating"
-  | "done"
-  | "failed";
+type UtteranceStatus = "listening" | "processing" | "done" | "failed";
 
-type ProxyConnectionState =
+type GeminiSessionState =
   | "disconnected"
   | "connecting"
-  | "connected"
-  | "reconnecting"
+  | "setup"
+  | "ready"
   | "error";
 
 type MeetingLifecycle = "idle" | "prompt" | "active" | "stopping";
@@ -35,12 +30,6 @@ interface PipelineUtterance {
   translatedText: string;
   sourceLang: string;
   targetLang: string;
-  confidence: number;
-}
-
-interface RateWarning {
-  remaining: number;
-  limit: number;
 }
 
 interface AuthSnapshot {
@@ -52,18 +41,29 @@ interface AuthSnapshot {
 
 interface PipelineSnapshot {
   isRunning: boolean;
-  proxyConnection: ProxyConnectionState;
+  youSessionState: GeminiSessionState;
+  themSessionState: GeminiSessionState;
   meetingLifecycle: MeetingLifecycle;
   meetingScore: number;
   meetingDecision: DetectionDecision;
   autoStopSecondsRemaining: number | null;
   utterances: PipelineUtterance[];
-  rateWarning: RateWarning | null;
   dailyRemainingMs: number | null;
-  sessionResetAtUtc: string | null;
-  lastProxyNotice: string | null;
+  error: string | null;
   activeLanguagePair: string;
   auth: AuthSnapshot;
+}
+
+interface LanguageSettings {
+  youSource: string;
+  youTarget: string;
+  themSource: string;
+  themTarget: string;
+}
+
+interface AppSettings {
+  tokenServiceUrl: string;
+  language: LanguageSettings;
 }
 
 interface AuthSignInInput {
@@ -85,10 +85,25 @@ interface PipelineApi {
   onUpdate: (listener: (snapshot: PipelineSnapshot) => void) => () => void;
 }
 
+interface SettingsApi {
+  get: () => Promise<AppSettings>;
+  updateTokenServiceUrl: (url: string) => Promise<AppSettings>;
+  updateLanguage: (language: LanguageSettings) => Promise<AppSettings>;
+}
+
 interface AuthApi {
   signIn: (input: AuthSignInInput) => Promise<AuthSnapshot>;
+  signUp: (input: AuthSignInInput) => Promise<AuthSnapshot>;
   signOut: () => Promise<AuthSnapshot>;
   get: () => Promise<AuthSnapshot>;
+}
+
+interface GeminiApi {
+  pushMicChunk: (base64Pcm: string) => Promise<void>;
+  pushSystemChunk: (base64Pcm: string) => Promise<void>;
+  resetUsage: () => Promise<void>;
+  onStartSystemAudio: (listener: (sourceId: string) => void) => () => void;
+  onStopSystemAudio: (listener: () => void) => () => void;
 }
 
 const overlayApi: OverlayWindowApi = {
@@ -117,19 +132,52 @@ const pipelineApi: PipelineApi = {
 };
 
 const authApi: AuthApi = {
-  signIn: (input: AuthSignInInput) => ipcRenderer.invoke("auth:sign-in", input),
+  signIn: (input: AuthSignInInput) =>
+    ipcRenderer.invoke("auth:sign-in", input),
+  signUp: (input: AuthSignInInput) =>
+    ipcRenderer.invoke("auth:sign-up", input),
   signOut: () => ipcRenderer.invoke("auth:sign-out"),
   get: () => ipcRenderer.invoke("auth:get"),
+};
+
+const settingsApi: SettingsApi = {
+  get: () => ipcRenderer.invoke("settings:get"),
+  updateTokenServiceUrl: (url: string) =>
+    ipcRenderer.invoke("settings:update-token-service-url", url),
+  updateLanguage: (language: LanguageSettings) =>
+    ipcRenderer.invoke("settings:update-language", language),
+};
+
+const geminiApi: GeminiApi = {
+  pushMicChunk: (base64Pcm: string) =>
+    ipcRenderer.invoke("audio:mic-chunk", base64Pcm),
+  pushSystemChunk: (base64Pcm: string) =>
+    ipcRenderer.invoke("audio:system-chunk", base64Pcm),
+  resetUsage: () => ipcRenderer.invoke("usage:reset"),
+  onStartSystemAudio: (listener) => {
+    const handler = (_event: unknown, sourceId: string) => listener(sourceId);
+    ipcRenderer.on("system-audio:start", handler);
+    return () => ipcRenderer.removeListener("system-audio:start", handler);
+  },
+  onStopSystemAudio: (listener) => {
+    const handler = () => listener();
+    ipcRenderer.on("system-audio:stop", handler);
+    return () => ipcRenderer.removeListener("system-audio:stop", handler);
+  },
 };
 
 contextBridge.exposeInMainWorld("overlay", overlayApi);
 contextBridge.exposeInMainWorld("pipelines", pipelineApi);
 contextBridge.exposeInMainWorld("auth", authApi);
+contextBridge.exposeInMainWorld("settings", settingsApi);
+contextBridge.exposeInMainWorld("gemini", geminiApi);
 
 declare global {
   interface Window {
     overlay: OverlayWindowApi;
     pipelines: PipelineApi;
     auth: AuthApi;
+    settings: SettingsApi;
+    gemini: GeminiApi;
   }
 }

@@ -40,8 +40,10 @@
     "vite": "^5.4.21"
   },
   "dependencies": {
+    "@google/genai": "^1.49.0",
     "@supabase/supabase-js": "^2.86.0",
     "electron-squirrel-startup": "^1.0.1",
+    "electron-store": "^10.1.0",
     "ws": "^8.18.0"
   }
 }

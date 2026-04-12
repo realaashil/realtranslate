@@ -6,23 +6,26 @@
     {
       "new_sqlite_classes": ["MyDurableObject"],
       "tag": "v1"
+    },
+    {
+      "deleted_classes": ["MyDurableObject"],
+      "new_sqlite_classes": ["UsageTracker"],
+      "tag": "v2"
     }
   ],
   "durable_objects": {
     "bindings": [
       {
-        "class_name": "MyDurableObject",
-        "name": "MY_DURABLE_OBJECT"
+        "class_name": "UsageTracker",
+        "name": "USAGE_TRACKER"
       }
     ]
   },
   "vars": {
-    "SUPABASE_URL": "https://your-project-ref.supabase.co",
+    "SUPABASE_URL": "https://hqvyqvxgumcoeedoijbn.supabase.co",
     "SUPABASE_JWT_AUDIENCE": "authenticated",
     "SUPABASE_JWT_ISSUER": "",
-    "ALLOW_LEGACY_DEV_JWT": "false",
-    "JWT_SECRET": "replace-me",
-    "GEMINI_API_KEY": ""
+    "GEMINI_API_KEY": "AIzaSyC89O5ywEoZqiOGlVI_w4eMu0JKzgJpk9I"
   },
   "observability": {
     "enabled": true

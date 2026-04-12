@@ -2,8 +2,7 @@ export type Speaker = "you" | "them";
 
 export type UtteranceStatus =
   | "listening"
-  | "transcribing"
-  | "translating"
+  | "processing"
   | "done"
   | "failed";
 
@@ -16,7 +15,6 @@ export interface Utterance {
   translatedText: string;
   sourceLang: string;
   targetLang: string;
-  confidence: number;
 }
 
 export interface QueueConfig {

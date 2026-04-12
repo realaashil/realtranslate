@@ -1,437 +1,636 @@
 import "./index.css";
 
-interface OverlayBounds {
-  x: number;
-  y: number;
-  width: number;
-  height: number;
-}
+// ── Types (must match preload.ts) ──
 
 type Speaker = "you" | "them";
-type UtteranceStatus =
-  | "listening"
-  | "transcribing"
-  | "translating"
-  | "done"
-  | "failed";
-
-type ProxyConnectionState =
+type UtteranceStatus = "listening" | "processing" | "done" | "failed";
+type GeminiSessionState =
   | "disconnected"
   | "connecting"
-  | "connected"
-  | "reconnecting"
+  | "setup"
+  | "ready"
   | "error";
-
 type MeetingLifecycle = "idle" | "prompt" | "active" | "stopping";
 type DetectionDecision = "auto-start" | "prompt" | "idle";
 type AuthStatus = "signed_out" | "signing_in" | "signed_in";
 
-interface RateWarning {
-  remaining: number;
-  limit: number;
-}
-
-interface AuthSnapshot {
-  status: AuthStatus;
-  email: string | null;
-  userId: string | null;
-  error: string | null;
-}
-
+interface OverlayBounds { x: number; y: number; width: number; height: number }
 interface PipelineUtterance {
-  id: string;
-  speaker: Speaker;
-  timestamp: number;
-  status: UtteranceStatus;
-  originalText: string;
-  translatedText: string;
-  sourceLang: string;
-  targetLang: string;
-  confidence: number;
+  id: string; speaker: Speaker; timestamp: number; status: UtteranceStatus;
+  originalText: string; translatedText: string; sourceLang: string; targetLang: string;
 }
-
+interface AuthSnapshot { status: AuthStatus; email: string | null; userId: string | null; error: string | null }
 interface PipelineSnapshot {
-  isRunning: boolean;
-  proxyConnection: ProxyConnectionState;
-  meetingLifecycle: MeetingLifecycle;
-  meetingScore: number;
-  meetingDecision: DetectionDecision;
-  autoStopSecondsRemaining: number | null;
-  utterances: PipelineUtterance[];
-  rateWarning: RateWarning | null;
-  dailyRemainingMs: number | null;
-  sessionResetAtUtc: string | null;
-  lastProxyNotice: string | null;
-  activeLanguagePair: string;
-  auth: AuthSnapshot;
+  isRunning: boolean; youSessionState: GeminiSessionState; themSessionState: GeminiSessionState;
+  meetingLifecycle: MeetingLifecycle; meetingScore: number; meetingDecision: DetectionDecision;
+  autoStopSecondsRemaining: number | null; utterances: PipelineUtterance[];
+  dailyRemainingMs: number | null; error: string | null; activeLanguagePair: string; auth: AuthSnapshot;
 }
+interface LanguageSettings { youSource: string; youTarget: string; themSource: string; themTarget: string }
+interface AppSettings { tokenServiceUrl: string; language: LanguageSettings }
 
-const root = document.createElement("main");
-root.className = "overlay-root";
+// ── Audio Capture State ──
 
-root.innerHTML = `
-  <header class="overlay-header">
-    <div class="title-block">
-      <strong>Realtime Translate</strong>
-      <p>Live desktop translation overlay</p>
-    </div>
-    <div class="header-actions">
-      <button id="toggle-btn" type="button">Hide</button>
-      <button id="pipeline-btn" type="button">Start</button>
-      <button id="clear-btn" type="button">Clear</button>
-    </div>
-  </header>
+let micStream: MediaStream | null = null;
+let audioContext: AudioContext | null = null;
+let workletNode: AudioWorkletNode | null = null;
+let systemStream: MediaStream | null = null;
+let systemAudioCtx: AudioContext | null = null;
+let systemWorkletNode: AudioWorkletNode | null = null;
+let settingsVisible = false;
 
-  <section class="auth-panel" id="auth-panel">
-    <div class="auth-summary">
-      <span class="status-label">Authentication</span>
-      <span id="auth-state" class="status-chip">signed_out</span>
-      <span id="auth-user" class="auth-user">Not signed in</span>
-    </div>
+// ── DOM Construction (Kinetic Precision) ──
 
-    <form id="auth-form" class="auth-form">
-      <input id="auth-email" type="email" placeholder="you@example.com" required />
-      <input id="auth-password" type="password" placeholder="Password" required />
-      <button id="auth-signin" type="submit">Sign in</button>
-      <button id="auth-signout" type="button">Sign out</button>
-    </form>
-
-    <p id="auth-error" class="auth-error"></p>
-  </section>
-
-  <section class="status-row">
-    <article class="status-card">
-      <span class="status-label">Proxy</span>
-      <span id="proxy-state" class="status-chip">disconnected</span>
-    </article>
-    <article class="status-card">
-      <span class="status-label">Meeting</span>
-      <span id="meeting-state" class="status-chip">idle</span>
-    </article>
-    <article class="status-card">
-      <span class="status-label">Mode</span>
-      <span id="pipeline-state" class="status-chip">stopped</span>
-    </article>
-    <article class="status-card">
-      <span class="status-label">Languages</span>
-      <span id="lang-pair" class="status-chip">en-US → hi-IN</span>
-    </article>
-  </section>
-
-  <section class="notice-row">
-    <div id="score-line" class="notice">Score: 0 (idle)</div>
-    <div id="autostop-line" class="notice">Auto-stop: n/a</div>
-    <div id="daily-line" class="notice">Daily remaining: n/a</div>
-    <div id="rate-line" class="notice">Rate: n/a</div>
-  </section>
-
-  <section class="feed" id="utterance-list"></section>
-
-  <footer class="overlay-footer">
-    <span id="proxy-notice">Proxy notice: ready</span>
-    <span id="bounds">Bounds: loading...</span>
-  </footer>
-`;
-
-document.body.append(root);
-
-const boundsNode = document.getElementById("bounds");
-const proxyStateNode = document.getElementById("proxy-state");
-const meetingStateNode = document.getElementById("meeting-state");
-const pipelineStateNode = document.getElementById("pipeline-state");
-const langPairNode = document.getElementById("lang-pair");
-const scoreNode = document.getElementById("score-line");
-const autoStopNode = document.getElementById("autostop-line");
-const dailyNode = document.getElementById("daily-line");
-const rateNode = document.getElementById("rate-line");
-const proxyNoticeNode = document.getElementById("proxy-notice");
-const utteranceListNode = document.getElementById("utterance-list");
-const authStateNode = document.getElementById("auth-state");
-const authUserNode = document.getElementById("auth-user");
-const authErrorNode = document.getElementById("auth-error");
-const authForm = document.getElementById("auth-form") as HTMLFormElement | null;
-const authEmailInput = document.getElementById("auth-email") as HTMLInputElement | null;
-const authPasswordInput = document.getElementById("auth-password") as HTMLInputElement | null;
-const authSignInButton = document.getElementById("auth-signin") as HTMLButtonElement | null;
-const authSignOutButton = document.getElementById("auth-signout") as HTMLButtonElement | null;
-const toggleButton = document.getElementById("toggle-btn");
-const pipelineButton = document.getElementById("pipeline-btn");
-const clearButton = document.getElementById("clear-btn");
-
-const formatBounds = (bounds: OverlayBounds): string => {
-  return `Bounds: x=${bounds.x}, y=${bounds.y}, w=${bounds.width}, h=${bounds.height}`;
-};
-
-const formatTime = (timestamp: number): string => {
-  const date = new Date(timestamp);
-  return date.toLocaleTimeString(undefined, {
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-  });
-};
-
-const formatRemaining = (remainingMs: number | null): string => {
-  if (remainingMs === null) {
-    return "n/a";
-  }
-
-  const totalSeconds = Math.max(0, Math.floor(remainingMs / 1000));
-  const minutes = Math.floor(totalSeconds / 60);
-  const seconds = totalSeconds % 60;
-  return `${minutes}m ${seconds}s`;
-};
-
-const confidenceLabel = (confidence: number): string => {
-  return `${(confidence * 100).toFixed(1)}%`;
-};
-
-const renderUtterance = (utterance: PipelineUtterance): string => {
-  const translatedText =
-    utterance.status === "failed"
-      ? utterance.translatedText || "(missed)"
-      : utterance.translatedText || "(translating...)";
-
-  const speakerLabel = utterance.speaker === "you" ? "YOU" : "THEM";
-
-  return `
-    <article class="state-card state-${utterance.status}">
-      <header>
-        <span class="speaker ${utterance.speaker}">${speakerLabel}</span>
-        <span class="state">${utterance.status}</span>
-        <time>${formatTime(utterance.timestamp)}</time>
-      </header>
-      <p class="original">${utterance.originalText || "(waiting for speech)"}</p>
-      <p class="translated">${translatedText}</p>
-      <footer>
-        <span>${utterance.sourceLang}</span>
-        <span>→</span>
-        <span>${utterance.targetLang}</span>
-        <span class="confidence">${confidenceLabel(utterance.confidence)}</span>
-      </footer>
-    </article>
-  `;
-};
-
-const chipClass = (value: string): string => {
-  if (value === "connected" || value === "running" || value === "active" || value === "signed_in") {
-    return "status-chip ok";
-  }
-
-  if (
-    value === "reconnecting" ||
-    value === "prompt" ||
-    value === "stopping" ||
-    value === "signing_in"
-  ) {
-    return "status-chip warn";
-  }
-
-  if (value === "error") {
-    return "status-chip danger";
-  }
-
-  return "status-chip";
-};
-
-const renderAuth = (auth: AuthSnapshot): void => {
-  if (authStateNode) {
-    authStateNode.textContent = auth.status;
-    authStateNode.className = chipClass(auth.status);
-  }
-
-  if (authUserNode) {
-    authUserNode.textContent = auth.email ?? "Not signed in";
-  }
-
-  if (authErrorNode) {
-    authErrorNode.textContent = auth.error ?? "";
-  }
-
-  if (authSignInButton) {
-    authSignInButton.disabled = auth.status === "signing_in" || auth.status === "signed_in";
-  }
-
-  if (authSignOutButton) {
-    authSignOutButton.disabled = auth.status !== "signed_in";
-  }
-
-  if (authEmailInput) {
-    authEmailInput.disabled = auth.status === "signing_in" || auth.status === "signed_in";
-  }
-
-  if (authPasswordInput) {
-    authPasswordInput.disabled = auth.status === "signing_in" || auth.status === "signed_in";
-  }
-};
-
-const renderSnapshot = (snapshot: PipelineSnapshot): void => {
-  renderAuth(snapshot.auth);
-
-  if (pipelineStateNode) {
-    const mode = snapshot.isRunning ? "running" : "stopped";
-    pipelineStateNode.textContent = mode;
-    pipelineStateNode.className = chipClass(mode);
-  }
-
-  if (proxyStateNode) {
-    proxyStateNode.textContent = snapshot.proxyConnection;
-    proxyStateNode.className = chipClass(snapshot.proxyConnection);
-  }
-
-  if (meetingStateNode) {
-    meetingStateNode.textContent = snapshot.meetingLifecycle;
-    meetingStateNode.className = chipClass(snapshot.meetingLifecycle);
-  }
-
-  if (langPairNode) {
-    langPairNode.textContent = snapshot.activeLanguagePair;
-  }
-
-  if (scoreNode) {
-    scoreNode.textContent = `Score: ${snapshot.meetingScore} (${snapshot.meetingDecision})`;
-  }
-
-  if (autoStopNode) {
-    autoStopNode.textContent =
-      snapshot.autoStopSecondsRemaining === null
-        ? "Auto-stop: n/a"
-        : `Auto-stop in ${snapshot.autoStopSecondsRemaining}s`;
-  }
-
-  if (dailyNode) {
-    const resetPart = snapshot.sessionResetAtUtc
-      ? ` • reset ${snapshot.sessionResetAtUtc}`
-      : "";
-    dailyNode.textContent = `Daily remaining: ${formatRemaining(snapshot.dailyRemainingMs)}${resetPart}`;
-  }
-
-  if (rateNode) {
-    if (snapshot.rateWarning) {
-      rateNode.textContent = `Rate warning: ${snapshot.rateWarning.remaining}/${snapshot.rateWarning.limit} left`;
-    } else {
-      rateNode.textContent = "Rate: normal";
+const el = <K extends keyof HTMLElementTagNameMap>(
+  tag: K,
+  attrs?: Record<string, string>,
+  ...children: (Node | string)[]
+): HTMLElementTagNameMap[K] => {
+  const e = document.createElement(tag);
+  if (attrs) {
+    for (const [k, v] of Object.entries(attrs)) {
+      if (k === "class") e.className = v;
+      else e.setAttribute(k, v);
     }
   }
-
-  if (proxyNoticeNode) {
-    proxyNoticeNode.textContent = `Proxy notice: ${snapshot.lastProxyNotice ?? "none"}`;
+  for (const c of children) {
+    e.append(typeof c === "string" ? document.createTextNode(c) : c);
   }
-
-  if (pipelineButton) {
-    pipelineButton.textContent = snapshot.isRunning ? "Stop" : "Start";
-    pipelineButton.toggleAttribute("disabled", snapshot.auth.status !== "signed_in");
-  }
-
-  if (!utteranceListNode) {
-    return;
-  }
-
-  if (snapshot.utterances.length === 0) {
-    utteranceListNode.innerHTML =
-      '<p class="empty">No captions yet. Sign in and start translation or wait for meeting auto-detection.</p>';
-    return;
-  }
-
-  utteranceListNode.innerHTML = snapshot.utterances
-    .slice(-10)
-    .map((item) => renderUtterance(item))
-    .join("");
+  return e;
 };
 
-const updateBounds = async (): Promise<void> => {
-  const bounds = await window.overlay.getBounds();
-  if (boundsNode) {
-    boundsNode.textContent = formatBounds(bounds);
+// Header
+const brandSpan = el("span", { class: "brand" }, "Kinetic Precision");
+const langBadge = el("span", { class: "lang-badge", id: "lang-badge" }, "EN → HI");
+const dailyMeta = el("span", { class: "header-meta", id: "daily-meta" });
+const toggleBtn = el("button", { id: "toggle-btn", type: "button" }, "Hide");
+const settingsBtn = el("button", { id: "settings-btn", type: "button" }, "Settings");
+const pipelineBtn = el("button", { id: "pipeline-btn", type: "button" }, "Start");
+const clearBtn = el("button", { id: "clear-btn", type: "button" }, "Clear");
+const resetUsageBtn = el("button", { id: "reset-usage-btn", type: "button" }, "Reset Limit");
+
+const header = el("header", { class: "overlay-header" },
+  el("div", { class: "header-left" }, brandSpan, langBadge),
+  el("div", { class: "header-right" },
+    dailyMeta,
+    el("div", { class: "header-actions" }, toggleBtn, settingsBtn, pipelineBtn, clearBtn, resetUsageBtn),
+  ),
+);
+
+// Auth panel — login / sign-up dual view
+let authMode: "login" | "signup" = "login";
+
+const authStateChip = el("span", { id: "auth-state" });
+const authUserSpan = el("span", {}, "Not signed in");
+const authErrorP = el("p", { class: "auth-error", id: "auth-error" });
+
+// Login form
+const loginEmailInput = el("input", { id: "login-email", type: "email", placeholder: "name@precision.io", required: "" });
+const loginPassInput = el("input", { id: "login-password", type: "password", placeholder: "Password" });
+const loginSubmitBtn = el("button", { type: "submit", class: "btn-primary" }, "Login");
+const authSignOutBtn = el("button", { id: "auth-signout", type: "button", class: "btn-secondary" }, "Sign out");
+const loginToggleLink = el("a", { href: "#", class: "auth-toggle-link" }, "Sign Up");
+const loginForm = el("form", { id: "login-form", class: "auth-form" },
+  el("div", { class: "auth-field" },
+    el("label", { for: "login-email" }, "Identity (Email)"),
+    loginEmailInput,
+  ),
+  el("div", { class: "auth-field" },
+    el("label", { for: "login-password" }, "Password"),
+    loginPassInput,
+  ),
+  el("div", { class: "auth-actions" }, loginSubmitBtn, authSignOutBtn),
+  authErrorP,
+  el("p", { class: "auth-footer-text" }, "New to the platform? ", loginToggleLink),
+);
+
+// Sign-up form
+const signupNameInput = el("input", { id: "signup-name", type: "text", placeholder: "Alex Mercer" });
+const signupEmailInput = el("input", { id: "signup-email", type: "email", placeholder: "operator@kinetic.app", required: "" });
+const signupPassInput = el("input", { id: "signup-password", type: "password", placeholder: "Password", required: "" });
+const signupConfirmInput = el("input", { id: "signup-confirm", type: "password", placeholder: "Confirm password", required: "" });
+const signupSubmitBtn = el("button", { type: "submit", class: "btn-primary" }, "Sign Up");
+const signupErrorP = el("p", { class: "auth-error", id: "signup-error" });
+const signupToggleLink = el("a", { href: "#", class: "auth-toggle-link" }, "Login");
+const signupForm = el("form", { id: "signup-form", class: "auth-form" },
+  el("div", { class: "auth-field" },
+    el("label", { for: "signup-name" }, "Full Name"),
+    signupNameInput,
+  ),
+  el("div", { class: "auth-field" },
+    el("label", { for: "signup-email" }, "Email Address"),
+    signupEmailInput,
+  ),
+  el("div", { class: "auth-field" },
+    el("label", { for: "signup-password" }, "Password"),
+    signupPassInput,
+  ),
+  el("div", { class: "auth-field" },
+    el("label", { for: "signup-confirm" }, "Confirm"),
+    signupConfirmInput,
+  ),
+  el("div", { class: "auth-actions" }, signupSubmitBtn),
+  signupErrorP,
+  el("p", { class: "auth-footer-text" }, "Already registered? ", signupToggleLink),
+);
+
+// Auth header + container
+const authHeaderTitle = el("p", {}, "Welcome Back");
+const loginContainer = el("div", { id: "login-container" }, loginForm);
+const signupContainer = el("div", { id: "signup-container", style: "display:none" }, signupForm);
+
+const authPanel = el("section", { class: "auth-panel", id: "auth-panel" },
+  el("div", { class: "auth-header" },
+    el("h2", {}, "KINETIC"),
+    authHeaderTitle,
+  ),
+  el("div", { class: "auth-status-line" }, authStateChip, authUserSpan),
+  loginContainer,
+  signupContainer,
+);
+
+const showAuthMode = (mode: "login" | "signup"): void => {
+  authMode = mode;
+  authErrorP.textContent = "";
+  signupErrorP.textContent = "";
+  if (mode === "login") {
+    loginContainer.style.display = "";
+    signupContainer.style.display = "none";
+    authHeaderTitle.textContent = "Welcome Back";
+  } else {
+    loginContainer.style.display = "none";
+    signupContainer.style.display = "";
+    authHeaderTitle.textContent = "Create Account";
   }
 };
 
-if (!window.overlay || !window.pipelines || !window.auth) {
-  throw new Error(
-    "Preload bridge unavailable. Ensure desktop app is running via Electron Forge (pnpm dev:desktop).",
-  );
-}
+// Status bar
+const youStatusDot = el("span", { class: "status-dot", id: "you-dot" });
+const themStatusDot = el("span", { class: "status-dot", id: "them-dot" });
+const meetingPill = el("span", { class: "status-pill", id: "meeting-pill" });
+const errorPill = el("span", { class: "status-pill", id: "error-pill" });
 
-if (toggleButton) {
-  toggleButton.addEventListener("click", async () => {
-    await window.overlay.toggleVisibility();
-    await updateBounds();
-  });
-}
+const statusBar = el("div", { class: "status-bar" },
+  el("span", { class: "status-pill" }, youStatusDot, "Mic"),
+  el("span", { class: "status-pill" }, themStatusDot, "System"),
+  meetingPill,
+  errorPill,
+);
 
-if (pipelineButton) {
-  pipelineButton.addEventListener("click", async () => {
-    const snapshot = await window.pipelines.get();
-    const next = snapshot.isRunning
-      ? await window.pipelines.stop()
-      : await window.pipelines.start();
+// Feed
+const feedSection = el("section", { class: "feed", id: "utterance-list" });
 
-    renderSnapshot(next);
-  });
-}
+// Bottom nav
+const navListening = el("div", { class: "nav-item inactive", id: "nav-listening" },
+  el("span", { class: "nav-item-label" }, "Listening"),
+);
+const navProcessing = el("div", { class: "nav-item inactive", id: "nav-processing" },
+  el("span", { class: "nav-item-label" }, "Processing"),
+);
+const navTranslating = el("div", { class: "nav-item inactive", id: "nav-translating" },
+  el("span", { class: "nav-item-label" }, "Translating"),
+);
+const navReady = el("div", { class: "nav-item inactive", id: "nav-ready" },
+  el("span", { class: "nav-item-label" }, "Ready"),
+);
+const bottomNav = el("nav", { class: "bottom-nav" }, navListening, navProcessing, navTranslating, navReady);
 
-if (clearButton) {
-  clearButton.addEventListener("click", async () => {
-    const next = await window.pipelines.clear();
-    renderSnapshot(next);
-  });
-}
+// Settings panel
+const tokenServiceInput = el("input", { id: "token-service-url", type: "text", placeholder: "http://127.0.0.1:8787" });
+const youTargetInput = el("input", { id: "you-target", type: "text", placeholder: "hi-IN" });
+const themTargetInput = el("input", { id: "them-target", type: "text", placeholder: "en-US" });
+const saveSettingsBtn = el("button", { id: "save-settings", type: "button", class: "btn-secondary" }, "Save");
+const settingsStatusP = el("p", { class: "settings-status", id: "settings-status" });
 
-if (authForm) {
-  authForm.addEventListener("submit", async (event) => {
-    event.preventDefault();
+const settingsPanel = el("section", { class: "settings-panel", id: "settings-panel" },
+  el("div", { class: "field" },
+    el("label", {}, "Token Service URL"),
+    tokenServiceInput,
+  ),
+  el("div", { class: "settings-row" },
+    el("div", { class: "field" }, el("label", {}, "You → Translate To"), youTargetInput),
+    el("div", { class: "field" }, el("label", {}, "Them → Translate To"), themTargetInput),
+  ),
+  el("div", { class: "settings-footer" }, saveSettingsBtn, settingsStatusP),
+);
 
-    if (!authEmailInput || !authPasswordInput) {
+// Footer
+const footerNotice = el("span", { id: "status-notice" }, "Ready");
+const footerBounds = el("span", { id: "bounds" });
+const footerEl = el("footer", { class: "overlay-footer" }, footerNotice, footerBounds);
+
+// Assemble
+const root = el("main", { class: "overlay-root" },
+  header, authPanel, statusBar, settingsPanel, feedSection, bottomNav, footerEl,
+);
+document.body.append(root);
+
+// ── Helpers ──
+
+const formatTime = (ts: number): string =>
+  new Date(ts).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+
+const formatRemaining = (ms: number | null): string => {
+  if (ms === null) return "";
+  const total = Math.max(0, Math.floor(ms / 1000));
+  return `${Math.floor(total / 60)}m left`;
+};
+
+// ── PCM Mic Capture ──
+
+const stopMicCapture = (): void => {
+  if (workletNode) { workletNode.disconnect(); workletNode.port.close(); workletNode = null; }
+  if (audioContext) { void audioContext.close(); audioContext = null; }
+  if (micStream) { micStream.getTracks().forEach((t) => t.stop()); micStream = null; }
+};
+
+const startMicCapture = async (): Promise<void> => {
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+    });
+    const ctx = new AudioContext({ sampleRate: 48000 });
+    await ctx.audioWorklet.addModule("pcm-worklet.js");
+    const source = ctx.createMediaStreamSource(stream);
+    const node = new AudioWorkletNode(ctx, "pcm-capture-processor");
+    node.port.onmessage = (ev: MessageEvent<ArrayBuffer>) => {
+      const bytes = new Uint8Array(ev.data);
+      let bin = "";
+      for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]!);
+      void window.gemini.pushMicChunk(btoa(bin));
+    };
+    source.connect(node);
+    micStream = stream; audioContext = ctx; workletNode = node;
+  } catch (err) {
+    footerNotice.textContent = `Mic error: ${err instanceof Error ? err.message : "unknown"}`;
+  }
+};
+
+// ── System Audio Capture (macOS/Windows via desktopCapturer) ──
+
+const stopSystemAudioCapture = (): void => {
+  if (systemWorkletNode) { systemWorkletNode.disconnect(); systemWorkletNode.port.close(); systemWorkletNode = null; }
+  if (systemAudioCtx) { void systemAudioCtx.close(); systemAudioCtx = null; }
+  if (systemStream) { systemStream.getTracks().forEach((t) => t.stop()); systemStream = null; }
+};
+
+const startSystemAudioCapture = async (sourceId: string): Promise<void> => {
+  stopSystemAudioCapture();
+  try {
+    // desktopCapturer requires both audio and video constraints
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        mandatory: {
+          chromeMediaSource: "desktop",
+          chromeMediaSourceId: sourceId,
+        },
+      } as unknown as MediaTrackConstraints,
+      video: {
+        mandatory: {
+          chromeMediaSource: "desktop",
+          chromeMediaSourceId: sourceId,
+        },
+      } as unknown as MediaTrackConstraints,
+    });
+
+    // Stop video tracks immediately — we only need audio
+    stream.getVideoTracks().forEach((t) => t.stop());
+
+    const audioTracks = stream.getAudioTracks();
+    if (audioTracks.length === 0) {
+      console.warn("[SystemAudio] No audio tracks from desktopCapturer");
       return;
     }
 
-    const email = authEmailInput.value.trim();
-    const password = authPasswordInput.value;
+    // Create audio-only stream
+    const audioStream = new MediaStream(audioTracks);
 
-    try {
-      await window.auth.signIn({ email, password });
-      const latest = await window.pipelines.get();
-      renderSnapshot(latest);
-    } catch (error) {
-      if (authErrorNode) {
-        authErrorNode.textContent =
-          error instanceof Error ? error.message : "Sign in failed";
-      }
+    const ctx = new AudioContext({ sampleRate: 48000 });
+    await ctx.audioWorklet.addModule("pcm-worklet.js");
+    const source = ctx.createMediaStreamSource(audioStream);
+    const node = new AudioWorkletNode(ctx, "pcm-capture-processor");
+
+    node.port.onmessage = (ev: MessageEvent<ArrayBuffer>) => {
+      const bytes = new Uint8Array(ev.data);
+      let bin = "";
+      for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]!);
+      void window.gemini.pushSystemChunk(btoa(bin));
+    };
+
+    source.connect(node);
+    systemStream = audioStream;
+    systemAudioCtx = ctx;
+    systemWorkletNode = node;
+    console.log("[SystemAudio] Renderer capture started");
+  } catch (err) {
+    console.error("[SystemAudio] Renderer capture failed:", err instanceof Error ? err.message : err);
+  }
+};
+
+// ── Rendering ──
+
+const createUtteranceEl = (u: PipelineUtterance): HTMLElement => {
+  const wrap = el("div", { class: `utterance ${u.speaker}` });
+
+  // Label row
+  const label = el("div", { class: "utterance-label" });
+  label.append(el("span", { class: "utterance-speaker" }, u.speaker === "you" ? "Local Input" : "Remote Speaker"));
+
+  if (u.status === "done") {
+    const check = el("span", { class: "utterance-status-icon done" }, "\u2713");
+    label.append(check);
+  } else if (u.status === "processing") {
+    const spin = el("span", { class: "utterance-status-icon processing" }, "\u25CB");
+    label.append(spin);
+  } else if (u.status === "listening") {
+    const pulse = el("span", { class: "utterance-status-icon listening" });
+    pulse.append(el("span", { class: "pulse-ring-small" }));
+    label.append(pulse);
+  }
+  wrap.append(label);
+
+  // Content
+  if (u.status === "listening" && !u.originalText) {
+    const dots = el("div", { class: "listening-dots" },
+      el("span", {}), el("span", {}), el("span", {}),
+    );
+    wrap.append(dots);
+  } else {
+    if (u.translatedText) {
+      wrap.append(el("p", { class: "utterance-translated" }, u.translatedText));
+    } else if (u.status === "processing") {
+      wrap.append(el("p", { class: "utterance-translated" }, "..."));
     }
-  });
+    if (u.originalText) {
+      wrap.append(el("p", { class: "utterance-original" }, u.originalText));
+    }
+  }
+
+  // Meta
+  wrap.append(el("span", { class: "utterance-meta" },
+    `${u.sourceLang} → ${u.targetLang} \u00B7 ${formatTime(u.timestamp)}`,
+  ));
+
+  return wrap;
+};
+
+const setDotState = (dot: HTMLElement, state: GeminiSessionState): void => {
+  dot.className = `status-dot ${state === "ready" ? "ready" : state === "connecting" || state === "setup" ? "connecting" : state === "error" ? "error" : ""}`;
+};
+
+const updateBottomNav = (utterances: PipelineUtterance[], isRunning: boolean): void => {
+  const hasListening = utterances.some((u) => u.status === "listening");
+  const hasProcessing = utterances.some((u) => u.status === "processing");
+  const hasDone = utterances.some((u) => u.status === "done");
+
+  navListening.className = `nav-item ${hasListening ? "active" : "inactive"}`;
+  navProcessing.className = `nav-item ${hasProcessing ? "active processing" : "inactive"}`;
+  navTranslating.className = `nav-item ${hasProcessing ? "active" : "inactive"}`;
+  navReady.className = `nav-item ${hasDone && !hasProcessing && !hasListening ? "active" : "inactive"}`;
+
+  if (!isRunning) {
+    navListening.className = navProcessing.className = navTranslating.className = navReady.className = "nav-item inactive";
+  }
+};
+
+const renderAuth = (auth: AuthSnapshot): void => {
+  if (auth.status === "signed_in") {
+    authStateChip.textContent = "\u25CF Connected";
+    authStateChip.style.color = "var(--primary)";
+    authUserSpan.textContent = auth.email ? `\u00B7 ${auth.email}` : "";
+  } else if (auth.status === "signing_in") {
+    authStateChip.textContent = "\u25CB Authenticating";
+    authStateChip.style.color = "var(--tertiary)";
+    authUserSpan.textContent = "";
+  } else {
+    authStateChip.textContent = "";
+    authUserSpan.textContent = "";
+  }
+
+  // Show error on whichever form is active
+  if (auth.error) {
+    if (authMode === "login") authErrorP.textContent = auth.error;
+    else signupErrorP.textContent = auth.error;
+  }
+
+  const busy = auth.status === "signing_in";
+  const signedIn = auth.status === "signed_in";
+
+  // Login form
+  loginSubmitBtn.disabled = busy || signedIn;
+  authSignOutBtn.disabled = !signedIn;
+  loginEmailInput.disabled = busy || signedIn;
+  loginPassInput.disabled = busy || signedIn;
+
+  // Signup form
+  signupSubmitBtn.disabled = busy || signedIn;
+  signupNameInput.disabled = busy || signedIn;
+  signupEmailInput.disabled = busy || signedIn;
+  signupPassInput.disabled = busy || signedIn;
+  signupConfirmInput.disabled = busy || signedIn;
+
+  // Hide auth panel when signed in
+  authPanel.style.display = signedIn ? "none" : "";
+};
+
+const renderSettings = (settings: AppSettings): void => {
+  tokenServiceInput.value = settings.tokenServiceUrl;
+  youTargetInput.value = settings.language.youTarget;
+  themTargetInput.value = settings.language.themTarget;
+};
+
+const renderSnapshot = (snap: PipelineSnapshot): void => {
+  renderAuth(snap.auth);
+
+  // Header
+  langBadge.textContent = snap.activeLanguagePair;
+  dailyMeta.textContent = formatRemaining(snap.dailyRemainingMs);
+  pipelineBtn.textContent = snap.isRunning ? "Stop" : "Go Live";
+  pipelineBtn.className = snap.isRunning ? "active" : "";
+  pipelineBtn.disabled = snap.auth.status !== "signed_in";
+
+  // Status bar
+  setDotState(youStatusDot, snap.youSessionState);
+  setDotState(themStatusDot, snap.themSessionState);
+
+  const meetingLabel = snap.meetingLifecycle === "active" ? "Meeting Active" : snap.meetingLifecycle === "prompt" ? "Meeting?" : "";
+  meetingPill.textContent = meetingLabel;
+  meetingPill.style.display = meetingLabel ? "" : "none";
+  if (snap.meetingLifecycle === "active") meetingPill.className = "status-pill highlight";
+  else meetingPill.className = "status-pill";
+
+  errorPill.textContent = snap.error ?? "";
+  errorPill.style.display = snap.error ? "" : "none";
+
+  // Feed
+  feedSection.replaceChildren();
+  if (snap.utterances.length === 0) {
+    const empty = el("div", { class: "empty-state" },
+      el("p", {}, snap.auth.status === "signed_in"
+        ? "Press Go Live to start translating."
+        : "Sign in to begin."),
+    );
+    feedSection.append(empty);
+  } else {
+    for (const u of snap.utterances.slice(-12)) {
+      feedSection.append(createUtteranceEl(u));
+    }
+    feedSection.scrollTop = feedSection.scrollHeight;
+  }
+
+  // Bottom nav
+  updateBottomNav(snap.utterances, snap.isRunning);
+};
+
+// ── Initialization ──
+
+const updateBounds = async (): Promise<void> => {
+  const b = await window.overlay.getBounds();
+  footerBounds.textContent = `${b.width}x${b.height}`;
+};
+
+if (!window.overlay || !window.pipelines || !window.auth || !window.settings || !window.gemini) {
+  throw new Error("Preload bridge unavailable.");
 }
 
-if (authSignOutButton) {
-  authSignOutButton.addEventListener("click", async () => {
-    try {
-      await window.auth.signOut();
-      const latest = await window.pipelines.get();
-      renderSnapshot(latest);
-    } catch (error) {
-      if (authErrorNode) {
-        authErrorNode.textContent =
-          error instanceof Error ? error.message : "Sign out failed";
-      }
-    }
-  });
-}
+// ── Event Handlers ──
 
-const unsubscribe = window.pipelines.onUpdate((snapshot) => {
-  renderSnapshot(snapshot);
+toggleBtn.addEventListener("click", async () => {
+  await window.overlay.toggleVisibility();
+  await updateBounds();
 });
+
+settingsBtn.addEventListener("click", () => {
+  settingsVisible = !settingsVisible;
+  settingsPanel.className = settingsVisible ? "settings-panel visible" : "settings-panel";
+  settingsBtn.className = settingsVisible ? "active" : "";
+});
+
+pipelineBtn.addEventListener("click", async () => {
+  const snap = await window.pipelines.get();
+  if (snap.isRunning) {
+    stopMicCapture();
+    renderSnapshot(await window.pipelines.stop());
+  } else {
+    const next = await window.pipelines.start();
+    renderSnapshot(next);
+    if (next.isRunning) await startMicCapture();
+  }
+});
+
+clearBtn.addEventListener("click", async () => {
+  renderSnapshot(await window.pipelines.clear());
+});
+
+resetUsageBtn.addEventListener("click", async () => {
+  await window.gemini.resetUsage();
+  renderSnapshot(await window.pipelines.get());
+});
+
+loginForm.addEventListener("submit", async (e) => {
+  e.preventDefault();
+  authErrorP.textContent = "";
+  const email = loginEmailInput.value.trim();
+  const password = loginPassInput.value;
+  try {
+    await window.auth.signIn({ email, password });
+    renderSnapshot(await window.pipelines.get());
+  } catch (err) {
+    authErrorP.textContent = err instanceof Error ? err.message : "Sign in failed";
+  }
+});
+
+signupForm.addEventListener("submit", async (e) => {
+  e.preventDefault();
+  signupErrorP.textContent = "";
+  const email = signupEmailInput.value.trim();
+  const password = signupPassInput.value;
+  const confirm = signupConfirmInput.value;
+
+  if (password !== confirm) {
+    signupErrorP.textContent = "Passwords do not match";
+    return;
+  }
+  if (password.length < 6) {
+    signupErrorP.textContent = "Password must be at least 6 characters";
+    return;
+  }
+
+  try {
+    await window.auth.signUp({ email, password });
+    renderSnapshot(await window.pipelines.get());
+  } catch (err) {
+    signupErrorP.textContent = err instanceof Error ? err.message : "Sign up failed";
+  }
+});
+
+loginToggleLink.addEventListener("click", (e) => {
+  e.preventDefault();
+  showAuthMode("signup");
+});
+
+signupToggleLink.addEventListener("click", (e) => {
+  e.preventDefault();
+  showAuthMode("login");
+});
+
+authSignOutBtn.addEventListener("click", async () => {
+  try {
+    stopMicCapture();
+    await window.auth.signOut();
+    renderSnapshot(await window.pipelines.get());
+  } catch (err) {
+    authErrorP.textContent = err instanceof Error ? err.message : "Sign out failed";
+  }
+});
+
+saveSettingsBtn.addEventListener("click", async () => {
+  try {
+    const [next] = await Promise.all([
+      window.settings.updateTokenServiceUrl(tokenServiceInput.value.trim()),
+      window.settings.updateLanguage({
+        youSource: "auto",
+        youTarget: youTargetInput.value.trim(),
+        themSource: "auto",
+        themTarget: themTargetInput.value.trim(),
+      }),
+    ]);
+    renderSettings(next);
+    settingsStatusP.textContent = "Saved.";
+    renderSnapshot(await window.pipelines.get());
+  } catch (err) {
+    settingsStatusP.textContent = err instanceof Error ? err.message : "Save failed";
+  }
+});
+
+// ── System Audio IPC (macOS/Windows) ──
+
+const unsubSystemStart = window.gemini.onStartSystemAudio((sourceId) => {
+  void startSystemAudioCapture(sourceId);
+});
+
+const unsubSystemStop = window.gemini.onStopSystemAudio(() => {
+  stopSystemAudioCapture();
+});
+
+// ── Live Updates ──
+
+const unsubscribe = window.pipelines.onUpdate((snap) => renderSnapshot(snap));
 
 void (async () => {
   await updateBounds();
+  renderSettings(await window.settings.get());
   await window.auth.get();
-  const initial = await window.pipelines.get();
-  renderSnapshot(initial);
+  renderSnapshot(await window.pipelines.get());
 })();
 
-const refreshTimer = window.setInterval(() => {
-  void updateBounds();
-}, 1500);
+const refreshTimer = window.setInterval(() => void updateBounds(), 5000);
 
 window.addEventListener("beforeunload", () => {
+  stopMicCapture();
+  stopSystemAudioCapture();
   window.clearInterval(refreshTimer);
   unsubscribe();
+  unsubSystemStart();
+  unsubSystemStop();
 });
