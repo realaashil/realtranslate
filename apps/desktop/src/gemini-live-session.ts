@@ -106,6 +106,7 @@ export class GeminiLiveSession extends EventEmitter {
         generationConfig: {
           responseModalities: ["AUDIO"],
           speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: "Puck" } } },
+          thinkingConfig: { thinkingBudget: 0 },
         },
         systemInstruction: {
           parts: [{ text: `You are a live translator. Translate everything you hear into ${targetLang}. Output ONLY the translation. No commentary, no explanations. Be concise and natural.` }],

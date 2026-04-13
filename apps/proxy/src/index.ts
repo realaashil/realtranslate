@@ -301,7 +301,7 @@ export class TranslationSession {
       const langName = LANG_NAMES[targetLang.split("-")[0]] ?? targetLang;
       const client = new GoogleGenAI({ apiKey: this.env.GEMINI_API_KEY });
       const result = await client.models.generateContent({
-        model: "gemini-2.5-flash",
+        model: "gemini-2.5-flash-lite",
         contents: [{ role: "user", parts: [{ text:
           `You are a real-time speech translator. Translate the following spoken text into ${langName}.
 
@@ -472,7 +472,7 @@ app.post("/api/translate", async (c) => {
     const langName = LANG_NAMES[parsed.data.targetLang.split("-")[0]] ?? parsed.data.targetLang;
     const client = new GoogleGenAI({ apiKey: c.env.GEMINI_API_KEY });
     const result = await client.models.generateContent({
-      model: "gemini-2.5-flash",
+      model: "gemini-2.5-flash-lite",
       contents: [{ role: "user", parts: [{ text:
         `You are a real-time speech translator. Translate the following spoken text into ${langName}.
 
