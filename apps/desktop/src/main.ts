@@ -501,7 +501,7 @@ const createTray = (): void => {
     { label: "Quit", click: () => app.quit() },
   ]);
 
-  tray.setToolTip("Realtime Translate Overlay");
+  tray.setToolTip("RealTranslate");
   tray.setContextMenu(menu);
   tray.on("click", () => toggleOverlay());
 };

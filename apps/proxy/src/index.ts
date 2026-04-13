@@ -298,13 +298,24 @@ export class TranslationSession {
 
   private async translate(text: string, targetLang: string): Promise<string> {
     try {
+      const langName = LANG_NAMES[targetLang.split("-")[0]] ?? targetLang;
       const client = new GoogleGenAI({ apiKey: this.env.GEMINI_API_KEY });
       const result = await client.models.generateContent({
         model: "gemini-2.5-flash",
-        contents: [{ role: "user", parts: [{ text: `Translate to ${targetLang}. Output ONLY the translation, nothing else.\n\n${text}` }] }],
-        config: { temperature: 0, maxOutputTokens: 256 },
+        contents: [{ role: "user", parts: [{ text:
+          `You are a real-time speech translator. Translate the following spoken text into ${langName}.
+
+Rules:
+- Output ONLY the translated text, nothing else — no labels, no quotes, no commentary
+- Translate the ENTIRE input from start to end — do not skip, truncate, or summarize any part
+- The input may be code-mixed (multiple languages in one sentence). Translate ALL of it into ${langName}
+- Keep proper nouns, brand names, and technical abbreviations (MCP, API, PR, etc.) as-is
+- Preserve tone, intent, and sentence structure naturally
+
+Text: ${text}` }] }],
+        config: { temperature: 0, maxOutputTokens: 512 },
       });
-      return result.text ?? "";
+      return result.text?.trim() ?? "";
     } catch (err) {
       console.error("[TranslationSession] Translation error:", err);
       return "";
@@ -346,6 +357,15 @@ interface DeepgramMsg {
   is_final?: boolean;
   channel?: { alternatives?: Array<{ transcript?: string; confidence?: number }> };
 }
+
+const LANG_NAMES: Record<string, string> = {
+  en: "English", hi: "Hindi", es: "Spanish", fr: "French", de: "German",
+  pt: "Portuguese", it: "Italian", ja: "Japanese", ko: "Korean", zh: "Chinese",
+  ar: "Arabic", ru: "Russian", nl: "Dutch", sv: "Swedish", pl: "Polish",
+  tr: "Turkish", vi: "Vietnamese", th: "Thai", id: "Indonesian", ms: "Malay",
+  bn: "Bengali", ta: "Tamil", te: "Telugu", mr: "Marathi", gu: "Gujarati",
+  kn: "Kannada", ml: "Malayalam", pa: "Punjabi", ur: "Urdu", uk: "Ukrainian",
+};
 
 function base64ToArrayBuffer(b64: string): ArrayBuffer {
   const bin = atob(b64);
@@ -449,13 +469,24 @@ app.post("/api/translate", async (c) => {
     return c.json({ code: "invalid_request", message: "Invalid request" } satisfies TokenError, 400);
 
   try {
+    const langName = LANG_NAMES[parsed.data.targetLang.split("-")[0]] ?? parsed.data.targetLang;
     const client = new GoogleGenAI({ apiKey: c.env.GEMINI_API_KEY });
     const result = await client.models.generateContent({
       model: "gemini-2.5-flash",
-      contents: [{ role: "user", parts: [{ text: `Translate to ${parsed.data.targetLang}. Output ONLY the translation, nothing else.\n\n${parsed.data.text}` }] }],
-      config: { temperature: 0, maxOutputTokens: 256 },
+      contents: [{ role: "user", parts: [{ text:
+        `You are a real-time speech translator. Translate the following spoken text into ${langName}.
+
+Rules:
+- Output ONLY the translated text, nothing else — no labels, no quotes, no commentary
+- Translate the ENTIRE input from start to end — do not skip, truncate, or summarize any part
+- The input may be code-mixed (multiple languages in one sentence). Translate ALL of it into ${langName}
+- Keep proper nouns, brand names, and technical abbreviations (MCP, API, PR, etc.) as-is
+- Preserve tone, intent, and sentence structure naturally
+
+Text: ${parsed.data.text}` }] }],
+      config: { temperature: 0, maxOutputTokens: 512 },
     });
-    return c.json({ text: result.text ?? "" });
+    return c.json({ text: result.text?.trim() ?? "" });
   } catch (err) {
     return c.json({ code: "token_generation_failed", message: err instanceof Error ? err.message : "Failed" } satisfies TokenError, 500);
   }

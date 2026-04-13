@@ -29,6 +29,50 @@ interface PipelineSnapshot {
 interface LanguageSettings { youSource: string; youTarget: string; themSource: string; themTarget: string }
 interface AppSettings { tokenServiceUrl: string; language: LanguageSettings }
 
+// ── Language Options ──
+
+const LANGUAGES: { code: string; flag: string; name: string }[] = [
+  { code: "en-US", flag: "\u{1F1FA}\u{1F1F8}", name: "English" },
+  { code: "hi-IN", flag: "\u{1F1EE}\u{1F1F3}", name: "Hindi" },
+  { code: "es-ES", flag: "\u{1F1EA}\u{1F1F8}", name: "Spanish" },
+  { code: "fr-FR", flag: "\u{1F1EB}\u{1F1F7}", name: "French" },
+  { code: "de-DE", flag: "\u{1F1E9}\u{1F1EA}", name: "German" },
+  { code: "pt-BR", flag: "\u{1F1E7}\u{1F1F7}", name: "Portuguese" },
+  { code: "it-IT", flag: "\u{1F1EE}\u{1F1F9}", name: "Italian" },
+  { code: "ja-JP", flag: "\u{1F1EF}\u{1F1F5}", name: "Japanese" },
+  { code: "ko-KR", flag: "\u{1F1F0}\u{1F1F7}", name: "Korean" },
+  { code: "zh-CN", flag: "\u{1F1E8}\u{1F1F3}", name: "Chinese" },
+  { code: "ar-SA", flag: "\u{1F1F8}\u{1F1E6}", name: "Arabic" },
+  { code: "ru-RU", flag: "\u{1F1F7}\u{1F1FA}", name: "Russian" },
+  { code: "nl-NL", flag: "\u{1F1F3}\u{1F1F1}", name: "Dutch" },
+  { code: "sv-SE", flag: "\u{1F1F8}\u{1F1EA}", name: "Swedish" },
+  { code: "pl-PL", flag: "\u{1F1F5}\u{1F1F1}", name: "Polish" },
+  { code: "tr-TR", flag: "\u{1F1F9}\u{1F1F7}", name: "Turkish" },
+  { code: "vi-VN", flag: "\u{1F1FB}\u{1F1F3}", name: "Vietnamese" },
+  { code: "th-TH", flag: "\u{1F1F9}\u{1F1ED}", name: "Thai" },
+  { code: "id-ID", flag: "\u{1F1EE}\u{1F1E9}", name: "Indonesian" },
+  { code: "bn-IN", flag: "\u{1F1EE}\u{1F1F3}", name: "Bengali" },
+  { code: "ta-IN", flag: "\u{1F1EE}\u{1F1F3}", name: "Tamil" },
+  { code: "te-IN", flag: "\u{1F1EE}\u{1F1F3}", name: "Telugu" },
+  { code: "mr-IN", flag: "\u{1F1EE}\u{1F1F3}", name: "Marathi" },
+  { code: "gu-IN", flag: "\u{1F1EE}\u{1F1F3}", name: "Gujarati" },
+  { code: "pa-IN", flag: "\u{1F1EE}\u{1F1F3}", name: "Punjabi" },
+  { code: "ur-PK", flag: "\u{1F1F5}\u{1F1F0}", name: "Urdu" },
+  { code: "uk-UA", flag: "\u{1F1FA}\u{1F1E6}", name: "Ukrainian" },
+];
+
+const makeLangSelect = (id: string, selected: string): HTMLSelectElement => {
+  const sel = el("select", { id, class: "lang-select" }) as unknown as HTMLSelectElement;
+  for (const lang of LANGUAGES) {
+    const opt = document.createElement("option");
+    opt.value = lang.code;
+    opt.textContent = `${lang.flag}  ${lang.name}`;
+    if (lang.code === selected) opt.selected = true;
+    sel.append(opt);
+  }
+  return sel;
+};
+
 // ── Audio Capture State ──
 
 let micStream: MediaStream | null = null;
@@ -39,7 +83,7 @@ let systemAudioCtx: AudioContext | null = null;
 let systemWorkletNode: AudioWorkletNode | null = null;
 let settingsVisible = false;
 
-// ── DOM Construction (Kinetic Precision) ──
+// ── DOM Construction ──
 
 const el = <K extends keyof HTMLElementTagNameMap>(
   tag: K,
@@ -60,7 +104,7 @@ const el = <K extends keyof HTMLElementTagNameMap>(
 };
 
 // Header
-const brandSpan = el("span", { class: "brand" }, "Kinetic Precision");
+const brandSpan = el("span", { class: "brand" }, "RealTranslate");
 const langBadge = el("span", { class: "lang-badge", id: "lang-badge" }, "EN → HI");
 const dailyMeta = el("span", { class: "header-meta", id: "daily-meta" });
 const toggleBtn = el("button", { id: "toggle-btn", type: "button" }, "Hide");
@@ -68,12 +112,13 @@ const settingsBtn = el("button", { id: "settings-btn", type: "button" }, "Settin
 const pipelineBtn = el("button", { id: "pipeline-btn", type: "button" }, "Start");
 const clearBtn = el("button", { id: "clear-btn", type: "button" }, "Clear");
 const resetUsageBtn = el("button", { id: "reset-usage-btn", type: "button" }, "Reset Limit");
+const headerSignOutBtn = el("button", { id: "header-signout", type: "button", style: "display:none" }, "Sign Out");
 
 const header = el("header", { class: "overlay-header" },
   el("div", { class: "header-left" }, brandSpan, langBadge),
   el("div", { class: "header-right" },
     dailyMeta,
-    el("div", { class: "header-actions" }, toggleBtn, settingsBtn, pipelineBtn, clearBtn, resetUsageBtn),
+    el("div", { class: "header-actions" }, toggleBtn, settingsBtn, pipelineBtn, clearBtn, resetUsageBtn, headerSignOutBtn),
   ),
 );
 
@@ -85,7 +130,7 @@ const authUserSpan = el("span", {}, "Not signed in");
 const authErrorP = el("p", { class: "auth-error", id: "auth-error" });
 
 // Login form
-const loginEmailInput = el("input", { id: "login-email", type: "email", placeholder: "name@precision.io", required: "" });
+const loginEmailInput = el("input", { id: "login-email", type: "email", placeholder: "you@example.com", required: "" });
 const loginPassInput = el("input", { id: "login-password", type: "password", placeholder: "Password" });
 const loginSubmitBtn = el("button", { type: "submit", class: "btn-primary" }, "Login");
 const authSignOutBtn = el("button", { id: "auth-signout", type: "button", class: "btn-secondary" }, "Sign out");
@@ -99,14 +144,14 @@ const loginForm = el("form", { id: "login-form", class: "auth-form" },
     el("label", { for: "login-password" }, "Password"),
     loginPassInput,
   ),
-  el("div", { class: "auth-actions" }, loginSubmitBtn, authSignOutBtn),
+  el("div", { class: "auth-actions" }, loginSubmitBtn),
   authErrorP,
-  el("p", { class: "auth-footer-text" }, "New to the platform? ", loginToggleLink),
+  el("p", { class: "auth-footer-text" }, "New to RealTranslate? ", loginToggleLink),
 );
 
 // Sign-up form
 const signupNameInput = el("input", { id: "signup-name", type: "text", placeholder: "Alex Mercer" });
-const signupEmailInput = el("input", { id: "signup-email", type: "email", placeholder: "operator@kinetic.app", required: "" });
+const signupEmailInput = el("input", { id: "signup-email", type: "email", placeholder: "you@example.com", required: "" });
 const signupPassInput = el("input", { id: "signup-password", type: "password", placeholder: "Password", required: "" });
 const signupConfirmInput = el("input", { id: "signup-confirm", type: "password", placeholder: "Confirm password", required: "" });
 const signupSubmitBtn = el("button", { type: "submit", class: "btn-primary" }, "Sign Up");
@@ -141,10 +186,9 @@ const signupContainer = el("div", { id: "signup-container", style: "display:none
 
 const authPanel = el("section", { class: "auth-panel", id: "auth-panel" },
   el("div", { class: "auth-header" },
-    el("h2", {}, "KINETIC"),
+    el("h2", {}, "REALTRANSLATE"),
     authHeaderTitle,
   ),
-  el("div", { class: "auth-status-line" }, authStateChip, authUserSpan),
   loginContainer,
   signupContainer,
 );
@@ -197,19 +241,15 @@ const bottomNav = el("nav", { class: "bottom-nav" }, navListening, navProcessing
 
 // Settings panel
 const tokenServiceInput = el("input", { id: "token-service-url", type: "text", placeholder: "http://127.0.0.1:8787" });
-const youTargetInput = el("input", { id: "you-target", type: "text", placeholder: "hi-IN" });
-const themTargetInput = el("input", { id: "them-target", type: "text", placeholder: "en-US" });
+const youTargetSelect = makeLangSelect("you-target", "hi-IN");
+const themTargetSelect = makeLangSelect("them-target", "en-US");
 const saveSettingsBtn = el("button", { id: "save-settings", type: "button", class: "btn-secondary" }, "Save");
 const settingsStatusP = el("p", { class: "settings-status", id: "settings-status" });
 
 const settingsPanel = el("section", { class: "settings-panel", id: "settings-panel" },
-  el("div", { class: "field" },
-    el("label", {}, "Token Service URL"),
-    tokenServiceInput,
-  ),
   el("div", { class: "settings-row" },
-    el("div", { class: "field" }, el("label", {}, "You → Translate To"), youTargetInput),
-    el("div", { class: "field" }, el("label", {}, "Them → Translate To"), themTargetInput),
+    el("div", { class: "field" }, el("label", {}, "You \u2192 Translate To"), youTargetSelect as unknown as HTMLElement),
+    el("div", { class: "field" }, el("label", {}, "Them \u2192 Translate To"), themTargetSelect as unknown as HTMLElement),
   ),
   el("div", { class: "settings-footer" }, saveSettingsBtn, settingsStatusP),
 );
@@ -517,12 +557,12 @@ const updateBottomNav = (utterances: PipelineUtterance[], isRunning: boolean): v
 
 const renderAuth = (auth: AuthSnapshot): void => {
   if (auth.status === "signed_in") {
-    authStateChip.textContent = "\u25CF Connected";
-    authStateChip.style.color = "var(--primary)";
-    authUserSpan.textContent = auth.email ? `\u00B7 ${auth.email}` : "";
+    authStateChip.textContent = "";
+    authStateChip.style.color = "";
+    authUserSpan.textContent = "";
   } else if (auth.status === "signing_in") {
-    authStateChip.textContent = "\u25CB Authenticating";
-    authStateChip.style.color = "var(--tertiary)";
+    authStateChip.textContent = "";
+    authStateChip.style.color = "";
     authUserSpan.textContent = "";
   } else {
     authStateChip.textContent = "";
@@ -551,14 +591,15 @@ const renderAuth = (auth: AuthSnapshot): void => {
   signupPassInput.disabled = busy || signedIn;
   signupConfirmInput.disabled = busy || signedIn;
 
-  // Hide auth panel when signed in
+  // Hide auth panel when signed in, show header sign-out
   authPanel.style.display = signedIn ? "none" : "";
+  headerSignOutBtn.style.display = signedIn ? "" : "none";
 };
 
 const renderSettings = (settings: AppSettings): void => {
   tokenServiceInput.value = settings.tokenServiceUrl;
-  youTargetInput.value = settings.language.youTarget;
-  themTargetInput.value = settings.language.themTarget;
+  youTargetSelect.value = settings.language.youTarget;
+  themTargetSelect.value = settings.language.themTarget;
 };
 
 const renderSnapshot = (snap: PipelineSnapshot): void => {
@@ -699,9 +740,9 @@ saveSettingsBtn.addEventListener("click", async () => {
       window.settings.updateTokenServiceUrl(tokenServiceInput.value.trim()),
       window.settings.updateLanguage({
         youSource: "auto",
-        youTarget: youTargetInput.value.trim(),
+        youTarget: youTargetSelect.value,
         themSource: "auto",
-        themTarget: themTargetInput.value.trim(),
+        themTarget: themTargetSelect.value,
       }),
     ]);
     renderSettings(next);
@@ -709,6 +750,16 @@ saveSettingsBtn.addEventListener("click", async () => {
     renderSnapshot(await window.pipelines.get());
   } catch (err) {
     settingsStatusP.textContent = err instanceof Error ? err.message : "Save failed";
+  }
+});
+
+headerSignOutBtn.addEventListener("click", async () => {
+  try {
+    stopMicCapture();
+    await window.auth.signOut();
+    renderSnapshot(await window.pipelines.get());
+  } catch (err) {
+    footerNotice.textContent = err instanceof Error ? err.message : "Sign out failed";
   }
 });
 

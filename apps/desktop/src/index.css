@@ -1,4 +1,4 @@
-/* ── Kinetic Precision Design System ── */
+/* ── RealTranslate Design System ── */
 
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&display=swap');
 
@@ -726,6 +726,46 @@ html, body {
 
 .field input:focus {
   box-shadow: 0 2px 0 0 var(--primary-dim);
+}
+
+.field select,
+.lang-select {
+  width: 100%;
+  background: var(--surface-container-lowest);
+  border: none;
+  color: var(--on-surface);
+  font-size: 14px;
+  padding: 10px 14px;
+  border-radius: 8px;
+  outline: none;
+  appearance: none;
+  -webkit-appearance: none;
+  cursor: pointer;
+  transition: box-shadow 200ms ease;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' fill='%23bbcabf' viewBox='0 0 16 16'%3E%3Cpath d='M8 11L3 6h10z'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 12px center;
+  padding-right: 32px;
+}
+
+.field select:focus,
+.lang-select:focus {
+  box-shadow: 0 2px 0 0 var(--primary-dim);
+}
+
+.field select option,
+.lang-select option {
+  background: var(--surface-container);
+  color: var(--on-surface);
+  padding: 8px;
+}
+
+#header-signout {
+  color: var(--error) !important;
+}
+
+#header-signout:hover {
+  background: rgba(255, 180, 171, 0.1) !important;
 }
 
 .settings-footer {
