@@ -1,0 +1,42 @@
+{
+  "name": "realtime-translate-proxy",
+  "main": "src/index.ts",
+  "account_id": "93c083772496870c5d1fb3d16d4f369f",
+  "compatibility_date": "2026-04-11",
+  "migrations": [
+    {
+      "new_sqlite_classes": ["MyDurableObject"],
+      "tag": "v1"
+    },
+    {
+      "deleted_classes": ["MyDurableObject"],
+      "new_sqlite_classes": ["UsageTracker"],
+      "tag": "v2"
+    },
+    {
+      "new_sqlite_classes": ["TranslationSession"],
+      "tag": "v3"
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "class_name": "UsageTracker",
+        "name": "USAGE_TRACKER"
+      },
+      {
+        "class_name": "TranslationSession",
+        "name": "TRANSLATION_SESSION"
+      }
+    ]
+  },
+  "vars": {
+    "SUPABASE_URL": "https://hqvyqvxgumcoeedoijbn.supabase.co",
+    "SUPABASE_JWT_AUDIENCE": "authenticated",
+    "SUPABASE_JWT_ISSUER": ""
+  },
+  // GEMINI_API_KEY and DEEPGRAM_API_KEY are set via `wrangler secret put`
+  "observability": {
+    "enabled": true
+  }
+}
