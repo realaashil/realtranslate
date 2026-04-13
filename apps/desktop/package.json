@@ -1,7 +1,7 @@
 {
   "name": "realtranslate",
   "productName": "RealTranslate",
-  "version": "1.0.4",
+  "version": "1.0.5",
   "description": "Real-time speech translation overlay",
   "main": ".vite/build/main.js",
   "private": true,
