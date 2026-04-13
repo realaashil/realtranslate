@@ -437,7 +437,7 @@ html, body {
   justify-content: flex-end;
   padding: 24px 32px;
   gap: 16px;
-  overflow: hidden;
+  overflow-y: auto;
 }
 
 .subtitle-row {

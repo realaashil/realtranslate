@@ -115,14 +115,13 @@ const settingsBtn = el("button", { id: "settings-btn", type: "button" }, "Settin
 const pipelineBtn = el("button", { id: "pipeline-btn", type: "button" }, "Start");
 const clearBtn = el("button", { id: "clear-btn", type: "button" }, "Clear");
 const viewModeBtn = el("button", { id: "view-mode-btn", type: "button" }, "Subtitle");
-const resetUsageBtn = el("button", { id: "reset-usage-btn", type: "button" }, "Reset Limit");
 const headerSignOutBtn = el("button", { id: "header-signout", type: "button", style: "display:none" }, "Sign Out");
 
 const header = el("header", { class: "overlay-header" },
   el("div", { class: "header-left" }, brandSpan, langBadge),
   el("div", { class: "header-right" },
     dailyMeta,
-    el("div", { class: "header-actions" }, toggleBtn, viewModeBtn, settingsBtn, pipelineBtn, clearBtn, resetUsageBtn, headerSignOutBtn),
+    el("div", { class: "header-actions" }, toggleBtn, viewModeBtn, settingsBtn, pipelineBtn, clearBtn, headerSignOutBtn),
   ),
 );
 
@@ -141,7 +140,7 @@ const authSignOutBtn = el("button", { id: "auth-signout", type: "button", class:
 const loginToggleLink = el("a", { href: "#", class: "auth-toggle-link" }, "Sign Up");
 const loginForm = el("form", { id: "login-form", class: "auth-form" },
   el("div", { class: "auth-field" },
-    el("label", { for: "login-email" }, "Identity (Email)"),
+    el("label", { for: "login-email" }, "Email"),
     loginEmailInput,
   ),
   el("div", { class: "auth-field" },
@@ -150,14 +149,14 @@ const loginForm = el("form", { id: "login-form", class: "auth-form" },
   ),
   el("div", { class: "auth-actions" }, loginSubmitBtn),
   authErrorP,
-  el("p", { class: "auth-footer-text" }, "New to RealTranslate? ", loginToggleLink),
+  el("p", { class: "auth-footer-text" }, "Don't have an account? ", loginToggleLink),
 );
 
 // Sign-up form
 const signupNameInput = el("input", { id: "signup-name", type: "text", placeholder: "Alex Mercer" });
 const signupEmailInput = el("input", { id: "signup-email", type: "email", placeholder: "you@example.com", required: "" });
 const signupPassInput = el("input", { id: "signup-password", type: "password", placeholder: "Password", required: "" });
-const signupConfirmInput = el("input", { id: "signup-confirm", type: "password", placeholder: "Confirm password", required: "" });
+const signupConfirmInput = el("input", { id: "signup-confirm", type: "password", placeholder: "Re-enter password", required: "" });
 const signupSubmitBtn = el("button", { type: "submit", class: "btn-primary" }, "Sign Up");
 const signupErrorP = el("p", { class: "auth-error", id: "signup-error" });
 const signupToggleLink = el("a", { href: "#", class: "auth-toggle-link" }, "Login");
@@ -175,12 +174,12 @@ const signupForm = el("form", { id: "signup-form", class: "auth-form" },
     signupPassInput,
   ),
   el("div", { class: "auth-field" },
-    el("label", { for: "signup-confirm" }, "Confirm"),
+    el("label", { for: "signup-confirm" }, "Confirm Password"),
     signupConfirmInput,
   ),
   el("div", { class: "auth-actions" }, signupSubmitBtn),
   signupErrorP,
-  el("p", { class: "auth-footer-text" }, "Already registered? ", signupToggleLink),
+  el("p", { class: "auth-footer-text" }, "Already have an account? ", signupToggleLink),
 );
 
 // Auth header + container
@@ -188,7 +187,7 @@ const authHeaderTitle = el("p", {}, "Welcome Back");
 const loginContainer = el("div", { id: "login-container" }, loginForm);
 const signupContainer = el("div", { id: "signup-container", style: "display:none" }, signupForm);
 
-const authPanel = el("section", { class: "auth-panel", id: "auth-panel" },
+const authPanel = el("section", { class: "auth-panel", id: "auth-panel", style: "display:none" },
   el("div", { class: "auth-header" },
     el("h2", {}, "REALTRANSLATE"),
     authHeaderTitle,
@@ -215,8 +214,8 @@ const showAuthMode = (mode: "login" | "signup"): void => {
 // Status bar
 const youStatusDot = el("span", { class: "status-dot", id: "you-dot" });
 const themStatusDot = el("span", { class: "status-dot", id: "them-dot" });
-const micPillLabel = el("span", {}, "Mic");
-const systemPillLabel = el("span", {}, "System");
+const micPillLabel = el("span", {}, "My mic");
+const systemPillLabel = el("span", {}, "Speaker");
 const micPill = el("span", { class: "status-pill stream-toggle", id: "mic-pill" }, youStatusDot, micPillLabel);
 const systemPill = el("span", { class: "status-pill stream-toggle", id: "system-pill" }, themStatusDot, systemPillLabel);
 const meetingPill = el("span", { class: "status-pill", id: "meeting-pill" });
@@ -266,14 +265,14 @@ const settingsStatusP = el("p", { class: "settings-status", id: "settings-status
 
 const settingsPanel = el("section", { class: "settings-panel", id: "settings-panel" },
   el("div", { class: "settings-row" },
-    el("div", { class: "field" }, el("label", {}, "You \u2192 Translate To"), youTargetSelect as unknown as HTMLElement),
-    el("div", { class: "field" }, el("label", {}, "Them \u2192 Translate To"), themTargetSelect as unknown as HTMLElement),
+    el("div", { class: "field" }, el("label", {}, "Translate me into"), youTargetSelect as unknown as HTMLElement),
+    el("div", { class: "field" }, el("label", {}, "Translate speaker into"), themTargetSelect as unknown as HTMLElement),
   ),
   el("div", { class: "settings-footer" }, saveSettingsBtn, settingsStatusP),
 );
 
 // Footer
-const footerNotice = el("span", { id: "status-notice" }, "Ready");
+const footerNotice = el("span", { id: "status-notice" }, "Ready to translate");
 const footerBounds = el("span", { id: "bounds" });
 const footerEl = el("footer", { class: "overlay-footer" }, footerNotice, footerBounds);
 
@@ -290,8 +289,12 @@ const formatTime = (ts: number): string =>
 
 const formatRemaining = (ms: number | null): string => {
   if (ms === null) return "";
-  const total = Math.max(0, Math.floor(ms / 1000));
-  return `${Math.floor(total / 60)}m left`;
+  const totalSec = Math.max(0, Math.floor(ms / 1000));
+  const hours = Math.floor(totalSec / 3600);
+  const mins = Math.floor((totalSec % 3600) / 60);
+  if (hours > 0) return `${hours}h ${mins}m remaining`;
+  if (mins > 0) return `${mins}m remaining`;
+  return "No time remaining";
 };
 
 // ── PCM Mic Capture ──
@@ -321,7 +324,7 @@ const startMicCapture = async (): Promise<void> => {
     source.connect(node);
     micStream = stream; audioContext = ctx; workletNode = node;
   } catch (err) {
-    footerNotice.textContent = `Mic error: ${err instanceof Error ? err.message : "unknown"}`;
+    footerNotice.textContent = `Couldn't access microphone: ${err instanceof Error ? err.message : "unknown error"}`;
   }
 };
 
@@ -351,7 +354,7 @@ const updateFeed = (utterances: PipelineUtterance[], isSignedIn: boolean): void 
 
   // Show empty state
   if (recent.length === 0) {
-    const msg = isSignedIn ? "Press Go Live to start translating." : "Sign in to begin.";
+    const msg = isSignedIn ? "Hit Go Live to start translating" : "Sign in to get started";
     const existing = feedSection.querySelector(".empty-state p");
     if (existing) {
       existing.textContent = msg;
@@ -541,7 +544,7 @@ const createUtteranceEl = (u: PipelineUtterance): HTMLElement => {
 
   // Label row
   const label = el("div", { class: "utterance-label" });
-  label.append(el("span", { class: "utterance-speaker" }, u.speaker === "you" ? "Local Input" : "Remote Speaker"));
+  label.append(el("span", { class: "utterance-speaker" }, u.speaker === "you" ? "Me" : "Speaker"));
 
   if (u.status === "done") {
     const check = el("span", { class: "utterance-status-icon done" }, "\u2713");
@@ -636,8 +639,8 @@ const renderAuth = (auth: AuthSnapshot): void => {
   signupPassInput.disabled = busy || signedIn;
   signupConfirmInput.disabled = busy || signedIn;
 
-  // Hide auth panel when signed in, show header sign-out
-  authPanel.style.display = signedIn ? "none" : "";
+  // Show auth panel only when definitively signed out, hide during sign-in or signed-in
+  authPanel.style.display = auth.status === "signed_out" ? "" : "none";
   headerSignOutBtn.style.display = signedIn ? "" : "none";
 };
 
@@ -661,9 +664,9 @@ const renderSnapshot = (snap: PipelineSnapshot): void => {
   setDotState(youStatusDot, micMuted ? "disconnected" : snap.youSessionState);
   setDotState(themStatusDot, systemMuted ? "disconnected" : snap.themSessionState);
   micPill.className = `status-pill stream-toggle${micMuted ? " muted" : ""}`;
-  micPillLabel.textContent = micMuted ? "Mic Off" : "Mic";
+  micPillLabel.textContent = micMuted ? "Mic muted" : "My mic";
   systemPill.className = `status-pill stream-toggle${systemMuted ? " muted" : ""}`;
-  systemPillLabel.textContent = systemMuted ? "System Off" : "System";
+  systemPillLabel.textContent = systemMuted ? "Muted" : "Speaker";
 
   const meetingLabel = snap.meetingLifecycle === "active" ? "Meeting Active" : snap.meetingLifecycle === "prompt" ? "Meeting?" : "";
   meetingPill.textContent = meetingLabel;
@@ -712,16 +715,29 @@ viewModeBtn.addEventListener("click", () => {
   bottomNav.style.display = viewMode === "subtitle" ? "none" : "";
 });
 
-micPill.addEventListener("click", () => {
+micPill.addEventListener("click", async () => {
   micMuted = !micMuted;
   micPill.className = `status-pill stream-toggle${micMuted ? " muted" : ""}`;
-  micPillLabel.textContent = micMuted ? "Mic Off" : "Mic";
+  micPillLabel.textContent = micMuted ? "Mic muted" : "My mic";
+  if (micMuted) {
+    stopMicCapture();
+    await window.gemini.muteSpeaker("you");
+  } else {
+    await window.gemini.unmuteSpeaker("you");
+    await startMicCapture();
+  }
 });
 
-systemPill.addEventListener("click", () => {
+systemPill.addEventListener("click", async () => {
   systemMuted = !systemMuted;
   systemPill.className = `status-pill stream-toggle${systemMuted ? " muted" : ""}`;
-  systemPillLabel.textContent = systemMuted ? "System Off" : "System";
+  systemPillLabel.textContent = systemMuted ? "Muted" : "Speaker";
+  if (systemMuted) {
+    stopSystemAudioCapture();
+    await window.gemini.muteSpeaker("them");
+  } else {
+    await window.gemini.unmuteSpeaker("them");
+  }
 });
 
 settingsBtn.addEventListener("click", () => {
@@ -746,11 +762,6 @@ clearBtn.addEventListener("click", async () => {
   renderSnapshot(await window.pipelines.clear());
 });
 
-resetUsageBtn.addEventListener("click", async () => {
-  await window.gemini.resetUsage();
-  renderSnapshot(await window.pipelines.get());
-});
-
 loginForm.addEventListener("submit", async (e) => {
   e.preventDefault();
   authErrorP.textContent = "";
@@ -760,7 +771,7 @@ loginForm.addEventListener("submit", async (e) => {
     await window.auth.signIn({ email, password });
     renderSnapshot(await window.pipelines.get());
   } catch (err) {
-    authErrorP.textContent = err instanceof Error ? err.message : "Sign in failed";
+    authErrorP.textContent = err instanceof Error ? err.message : "Couldn't sign in, please try again";
   }
 });
 
@@ -772,7 +783,7 @@ signupForm.addEventListener("submit", async (e) => {
   const confirm = signupConfirmInput.value;
 
   if (password !== confirm) {
-    signupErrorP.textContent = "Passwords do not match";
+    signupErrorP.textContent = "Passwords don't match";
     return;
   }
   if (password.length < 6) {
@@ -784,7 +795,7 @@ signupForm.addEventListener("submit", async (e) => {
     await window.auth.signUp({ email, password });
     renderSnapshot(await window.pipelines.get());
   } catch (err) {
-    signupErrorP.textContent = err instanceof Error ? err.message : "Sign up failed";
+    signupErrorP.textContent = err instanceof Error ? err.message : "Couldn't create account, please try again";
   }
 });
 
@@ -804,7 +815,7 @@ authSignOutBtn.addEventListener("click", async () => {
     await window.auth.signOut();
     renderSnapshot(await window.pipelines.get());
   } catch (err) {
-    authErrorP.textContent = err instanceof Error ? err.message : "Sign out failed";
+    authErrorP.textContent = err instanceof Error ? err.message : "Couldn't sign out, please try again";
   }
 });
 
@@ -820,10 +831,10 @@ saveSettingsBtn.addEventListener("click", async () => {
       }),
     ]);
     renderSettings(next);
-    settingsStatusP.textContent = "Saved.";
+    settingsStatusP.textContent = "Settings saved";
     renderSnapshot(await window.pipelines.get());
   } catch (err) {
-    settingsStatusP.textContent = err instanceof Error ? err.message : "Save failed";
+    settingsStatusP.textContent = err instanceof Error ? err.message : "Couldn't save settings";
   }
 });
 
@@ -833,7 +844,7 @@ headerSignOutBtn.addEventListener("click", async () => {
     await window.auth.signOut();
     renderSnapshot(await window.pipelines.get());
   } catch (err) {
-    footerNotice.textContent = err instanceof Error ? err.message : "Sign out failed";
+    footerNotice.textContent = err instanceof Error ? err.message : "Couldn't sign out";
   }
 });
 

@@ -351,6 +351,20 @@ export class GeminiSessionManager {
     this.send({ type: "audio", speaker: "them", data: base64Pcm });
   }
 
+  muteSpeaker(speaker: Speaker): void {
+    this.send({ type: "mute", speaker });
+    if (speaker === "you") this.youState = "disconnected";
+    else this.themState = "disconnected";
+    this.emitSnapshot();
+  }
+
+  unmuteSpeaker(speaker: Speaker): void {
+    this.send({ type: "unmute", speaker });
+    if (speaker === "you") this.youState = "connecting";
+    else this.themState = "connecting";
+    this.emitSnapshot();
+  }
+
   stopSessions(): void {
     this.send({ type: "stop" });
     this.isRunning = false;
@@ -361,19 +375,6 @@ export class GeminiSessionManager {
     this.themState = "disconnected";
     if (this.ws) { try { this.ws.close(); } catch { /* */ } this.ws = null; }
     this.emitSnapshot();
-  }
-
-  async resetUsage(): Promise<void> {
-    if (!this.accessToken) return;
-    try {
-      await fetch(`${this.config.tokenServiceUrl}/api/reset-usage`, {
-        method: "POST",
-        headers: { Authorization: `Bearer ${this.accessToken}`, "Content-Type": "application/json" },
-      });
-      this.dailyRemainingMs = SESSION_LIMITS.dailySessionMs;
-      this.lastError = null;
-      this.emitSnapshot();
-    } catch { /* */ }
   }
 
   clearUtterances(): void {

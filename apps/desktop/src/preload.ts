@@ -101,7 +101,8 @@ interface AuthApi {
 interface GeminiApi {
   pushMicChunk: (base64Pcm: string) => Promise<void>;
   pushSystemChunk: (base64Pcm: string) => Promise<void>;
-  resetUsage: () => Promise<void>;
+  muteSpeaker: (speaker: "you" | "them") => Promise<void>;
+  unmuteSpeaker: (speaker: "you" | "them") => Promise<void>;
   onStartSystemAudio: (listener: (sourceId: string) => void) => () => void;
   onStopSystemAudio: (listener: () => void) => () => void;
 }
@@ -153,7 +154,10 @@ const geminiApi: GeminiApi = {
     ipcRenderer.invoke("audio:mic-chunk", base64Pcm),
   pushSystemChunk: (base64Pcm: string) =>
     ipcRenderer.invoke("audio:system-chunk", base64Pcm),
-  resetUsage: () => ipcRenderer.invoke("usage:reset"),
+  muteSpeaker: (speaker: "you" | "them") =>
+    ipcRenderer.invoke("audio:mute-speaker", speaker),
+  unmuteSpeaker: (speaker: "you" | "them") =>
+    ipcRenderer.invoke("audio:unmute-speaker", speaker),
   onStartSystemAudio: (listener) => {
     const handler = (_event: unknown, sourceId: string) => listener(sourceId);
     ipcRenderer.on("system-audio:start", handler);

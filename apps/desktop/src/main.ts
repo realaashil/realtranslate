@@ -13,6 +13,7 @@ import fs from "node:fs";
 import path from "node:path";
 import started from "electron-squirrel-startup";
 
+import { LANGUAGE_NAMES } from "@realtime/shared";
 import type { SupportedLanguage, Utterance } from "@realtime/shared";
 
 import {
@@ -273,8 +274,11 @@ const applySession = (
 
 // ── Snapshot ──
 
+const langName = (code: string): string =>
+  LANGUAGE_NAMES[code as SupportedLanguage] ?? code;
+
 const activeLanguagePair = (): string =>
-  `You → ${appSettings.language.youTarget} | Them → ${appSettings.language.themTarget}`;
+  `${langName(appSettings.language.youTarget)} · ${langName(appSettings.language.themTarget)}`;
 
 const authSnapshot = (): AuthSnapshot => ({
   status: authStatus,
@@ -431,11 +435,13 @@ const toggleOverlay = (): boolean => {
 
 const resolveTrayIconPath = (): string | null => {
   const candidatePaths = [
+    // Packaged build: extraResource copies to resources/
+    path.join(process.resourcesPath, "trayIcon.png"),
+    // Dev mode
     path.join(__dirname, "../assets/trayIcon.png"),
     path.join(__dirname, "../../src/assets/trayIcon.png"),
     path.join(__dirname, "../../../src/assets/trayIcon.png"),
     path.join(process.cwd(), "src/assets/trayIcon.png"),
-    path.join(process.cwd(), "apps/desktop/src/assets/trayIcon.png"),
   ];
 
   return candidatePaths.find((candidate) => fs.existsSync(candidate)) ?? null;
@@ -455,6 +461,7 @@ const createOverlayWindow = (): BrowserWindow => {
     alwaysOnTop: true,
     hasShadow: false,
     resizable: true,
+    skipTaskbar: true,
     webPreferences: {
       preload: preloadPath,
       contextIsolation: true,
@@ -676,7 +683,13 @@ const registerIpcHandlers = (): void => {
     sessionManager.pushSystemAudio(base64Pcm);
   });
 
-  ipcMain.handle("usage:reset", () => sessionManager.resetUsage());
+  ipcMain.handle("audio:mute-speaker", (_event, speaker: "you" | "them") => {
+    sessionManager.muteSpeaker(speaker);
+  });
+
+  ipcMain.handle("audio:unmute-speaker", (_event, speaker: "you" | "them") => {
+    sessionManager.unmuteSpeaker(speaker);
+  });
 };
 
 // ── Meeting Detection ──
@@ -735,6 +748,8 @@ const meetingOrchestrator = new MeetingOrchestrator({
 // ── App Lifecycle ──
 
 app.on("ready", async () => {
+  if (process.platform === "darwin") app.dock?.hide();
+
   appSettings = readSettings();
   sessionManager.updateConfig({
     tokenServiceUrl: appSettings.tokenServiceUrl,
@@ -753,7 +768,7 @@ app.on("ready", async () => {
     applySession(session ?? null, session?.user ?? null);
   });
 
-  meetingOrchestrator.start();
+  // meetingOrchestrator.start(); // TODO: re-enable when meeting detection is ready
   emitSnapshot();
 });
 
@@ -781,6 +796,6 @@ app.on("will-quit", () => {
     systemAudioCapture = null;
   }
   sessionManager.dispose();
-  meetingOrchestrator.stop();
+  // meetingOrchestrator.stop();
   globalShortcut.unregisterAll();
 });

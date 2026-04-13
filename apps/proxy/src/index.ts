@@ -224,6 +224,23 @@ export class TranslationSession {
       return;
     }
 
+    if (msg.type === "mute") {
+      const speaker = msg.speaker;
+      const dg = speaker === "you" ? this.youDg : this.themDg;
+      if (dg && dg.readyState === WebSocket.OPEN) {
+        dg.close();
+      }
+      if (speaker === "you") this.youDg = null;
+      else this.themDg = null;
+      return;
+    }
+
+    if (msg.type === "unmute") {
+      const speaker = msg.speaker;
+      this.startDeepgram(speaker);
+      return;
+    }
+
     if (msg.type === "stop") {
       this.cleanup();
       return;
@@ -298,7 +315,8 @@ export class TranslationSession {
 
   private async translate(text: string, targetLang: string): Promise<string> {
     try {
-      const langName = LANG_NAMES[targetLang.split("-")[0]] ?? targetLang;
+      const langKey = targetLang.split("-")[0] ?? targetLang;
+      const langName = LANG_NAMES[langKey] ?? targetLang;
       const client = new GoogleGenAI({ apiKey: this.env.GEMINI_API_KEY });
       const result = await client.models.generateContent({
         model: "gemini-2.5-flash-lite",
@@ -340,6 +358,8 @@ type ClientMsg =
   | { type: "config"; youTarget?: string; themTarget?: string }
   | { type: "start" }
   | { type: "audio"; speaker: "you" | "them"; data: string }
+  | { type: "mute"; speaker: "you" | "them" }
+  | { type: "unmute"; speaker: "you" | "them" }
   | { type: "stop" };
 
 type ServerMsg =
@@ -469,7 +489,8 @@ app.post("/api/translate", async (c) => {
     return c.json({ code: "invalid_request", message: "Invalid request" } satisfies TokenError, 400);
 
   try {
-    const langName = LANG_NAMES[parsed.data.targetLang.split("-")[0]] ?? parsed.data.targetLang;
+    const langKey = parsed.data.targetLang.split("-")[0] ?? parsed.data.targetLang;
+    const langName = LANG_NAMES[langKey] ?? parsed.data.targetLang;
     const client = new GoogleGenAI({ apiKey: c.env.GEMINI_API_KEY });
     const result = await client.models.generateContent({
       model: "gemini-2.5-flash-lite",
@@ -502,17 +523,6 @@ app.post("/api/report-usage", async (c) => {
   const doId = c.env.USAGE_TRACKER.idFromName(claims.sub);
   const stub = c.env.USAGE_TRACKER.get(doId);
   const res = await stub.fetch(new Request("https://do/report-usage", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }));
-  return c.json(await res.json());
-});
-
-app.post("/api/reset-usage", async (c) => {
-  const authHeader = c.req.header("Authorization");
-  if (!authHeader?.startsWith("Bearer ")) return c.json({ code: "unauthorized", message: "Missing Authorization" } satisfies TokenError, 401);
-  const claims = await verifySupabaseToken(authHeader.slice(7), c.env);
-  if (!claims) return c.json({ code: "unauthorized", message: "Token verification failed" } satisfies TokenError, 401);
-  const doId = c.env.USAGE_TRACKER.idFromName(claims.sub);
-  const stub = c.env.USAGE_TRACKER.get(doId);
-  const res = await stub.fetch(new Request("https://do/reset", { method: "POST" }));
   return c.json(await res.json());
 });
 
