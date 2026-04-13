@@ -97,7 +97,7 @@ const MEETING_PROCESS_HINTS = [
 ] as const;
 
 const DEFAULT_TOKEN_SERVICE_URL =
-  process.env.TOKEN_SERVICE_URL ?? "http://127.0.0.1:8787";
+  process.env.TOKEN_SERVICE_URL || "http://127.0.0.1:8787";
 const DEFAULT_LANGUAGE_SETTINGS: LanguageSettings = {
   youSource: "auto",
   youTarget: "hi-IN",
@@ -144,7 +144,7 @@ const readSettings = (): AppSettings => {
   };
 
   return {
-    tokenServiceUrl: store.get("tokenServiceUrl", DEFAULT_TOKEN_SERVICE_URL),
+    tokenServiceUrl: store.get("tokenServiceUrl", DEFAULT_TOKEN_SERVICE_URL) || DEFAULT_TOKEN_SERVICE_URL,
     language: store.get("language", DEFAULT_LANGUAGE_SETTINGS),
     overlayBounds: store.get("overlayBounds", DEFAULT_OVERLAY_BOUNDS),
   };

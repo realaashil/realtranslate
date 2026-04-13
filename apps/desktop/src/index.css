@@ -101,10 +101,21 @@ html, body {
   align-items: center;
   padding: 0 24px;
   height: 56px;
-  background: rgba(19, 19, 19, 0.5);
+  background: rgba(19, 19, 19, 0.95);
   backdrop-filter: blur(24px);
   border-bottom: 1px solid rgba(255, 255, 255, 0.05);
   flex-shrink: 0;
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  -webkit-app-region: drag;
+}
+
+.overlay-header button,
+.overlay-header select,
+.overlay-header input,
+.overlay-header a {
+  -webkit-app-region: no-drag;
 }
 
 .header-left {
@@ -486,10 +497,17 @@ html, body {
 .feed {
   flex: 1;
   overflow-y: auto;
+  overflow-anchor: none;
   padding: 24px 32px 100px;
   display: flex;
   flex-direction: column;
   gap: 24px;
+}
+
+.feed-anchor {
+  overflow-anchor: auto;
+  height: 1px;
+  flex-shrink: 0;
 }
 
 /* Scrollbar — thin, translucent, fades in on hover */

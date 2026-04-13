@@ -230,6 +230,8 @@ const statusBar = el("div", { class: "status-bar" },
 
 // Feed
 const feedSection = el("section", { class: "feed", id: "utterance-list" });
+const feedAnchor = el("div", { class: "feed-anchor" });
+feedSection.append(feedAnchor);
 
 // Subtitle view — shows only the latest utterance per speaker
 const subtitleYouText = el("p", { class: "subtitle-text you" });
@@ -359,9 +361,9 @@ const updateFeed = (utterances: PipelineUtterance[], isSignedIn: boolean): void 
     if (existing) {
       existing.textContent = msg;
     } else {
-      feedSection.replaceChildren();
-      feedSection.append(
+      feedSection.replaceChildren(
         el("div", { class: "empty-state" }, el("p", {}, msg)),
+        feedAnchor,
       );
     }
     return;
@@ -378,7 +380,7 @@ const updateFeed = (utterances: PipelineUtterance[], isSignedIn: boolean): void 
       // New utterance — create DOM
       const wrap = createUtteranceEl(u);
       wrap.setAttribute("data-id", u.id);
-      feedSection.append(wrap);
+      feedSection.insertBefore(wrap, feedAnchor);
       feedElements.set(u.id, {
         wrap,
         translatedP: wrap.querySelector(".utterance-translated"),
@@ -450,7 +452,6 @@ const updateFeed = (utterances: PipelineUtterance[], isSignedIn: boolean): void 
     }
   }
 
-  feedSection.scrollTo({ top: feedSection.scrollHeight, behavior: "smooth" });
 };
 
 const updateSubtitleView = (utterances: PipelineUtterance[]): void => {
