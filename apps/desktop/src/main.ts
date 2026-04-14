@@ -144,7 +144,8 @@ const readSettings = (): AppSettings => {
   };
 
   return {
-    tokenServiceUrl: store.get("tokenServiceUrl", DEFAULT_TOKEN_SERVICE_URL) || DEFAULT_TOKEN_SERVICE_URL,
+    // If TOKEN_SERVICE_URL was set at build time, always use it (overrides persisted value)
+    tokenServiceUrl: process.env.TOKEN_SERVICE_URL || store.get("tokenServiceUrl", DEFAULT_TOKEN_SERVICE_URL) || DEFAULT_TOKEN_SERVICE_URL,
     language: store.get("language", DEFAULT_LANGUAGE_SETTINGS),
     overlayBounds: store.get("overlayBounds", DEFAULT_OVERLAY_BOUNDS),
   };
@@ -575,11 +576,38 @@ const signUpWithPassword = async (
   if (data.session) {
     applySession(data.session, data.user ?? null);
   } else {
+    // User created but needs email verification — prompt for OTP
     authStatus = "signed_out";
-    authError = "Check your email to confirm your account.";
+    authError = null;
     emitSnapshot();
   }
 
+  return authSnapshot();
+};
+
+const verifyOtp = async (
+  email: string,
+  token: string,
+): Promise<AuthSnapshot> => {
+  authStatus = "signing_in";
+  authError = null;
+  emitSnapshot();
+
+  const { data, error } = await supabase.auth.verifyOtp({
+    email,
+    token,
+    type: "signup",
+  });
+
+  if (error) {
+    authStatus = "signed_out";
+    authError = error.message;
+    emitSnapshot();
+    throw new Error(error.message);
+  }
+
+  applySession(data.session ?? null, data.user ?? null);
+  authError = null;
   return authSnapshot();
 };
 
@@ -651,6 +679,8 @@ const registerIpcHandlers = (): void => {
     overlayWindow.setBounds(bounds);
   });
 
+  ipcMain.handle("app:quit", () => app.quit());
+
   ipcMain.handle("pipelines:start", () => startPipelines());
   ipcMain.handle("pipelines:stop", () => stopPipelines());
   ipcMain.handle("pipelines:clear", () => clearUtterances());
@@ -661,6 +691,9 @@ const registerIpcHandlers = (): void => {
   );
   ipcMain.handle("auth:sign-up", (_event, input: AuthSignInInput) =>
     signUpWithPassword(input),
+  );
+  ipcMain.handle("auth:verify-otp", (_event, email: string, token: string) =>
+    verifyOtp(email, token),
   );
   ipcMain.handle("auth:sign-out", () => signOut());
   ipcMain.handle("auth:get", () => getAuthSnapshot());

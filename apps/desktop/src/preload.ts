@@ -75,6 +75,7 @@ interface OverlayWindowApi {
   toggleVisibility: () => Promise<boolean>;
   getBounds: () => Promise<OverlayBounds>;
   setBounds: (bounds: OverlayBounds) => Promise<void>;
+  quit: () => Promise<void>;
 }
 
 interface PipelineApi {
@@ -94,6 +95,7 @@ interface SettingsApi {
 interface AuthApi {
   signIn: (input: AuthSignInInput) => Promise<AuthSnapshot>;
   signUp: (input: AuthSignInInput) => Promise<AuthSnapshot>;
+  verifyOtp: (email: string, token: string) => Promise<AuthSnapshot>;
   signOut: () => Promise<AuthSnapshot>;
   get: () => Promise<AuthSnapshot>;
 }
@@ -112,6 +114,7 @@ const overlayApi: OverlayWindowApi = {
   getBounds: () => ipcRenderer.invoke("overlay:get-bounds"),
   setBounds: (bounds: OverlayBounds) =>
     ipcRenderer.invoke("overlay:set-bounds", bounds),
+  quit: () => ipcRenderer.invoke("app:quit"),
 };
 
 const pipelineApi: PipelineApi = {
@@ -137,6 +140,8 @@ const authApi: AuthApi = {
     ipcRenderer.invoke("auth:sign-in", input),
   signUp: (input: AuthSignInInput) =>
     ipcRenderer.invoke("auth:sign-up", input),
+  verifyOtp: (email: string, token: string) =>
+    ipcRenderer.invoke("auth:verify-otp", email, token),
   signOut: () => ipcRenderer.invoke("auth:sign-out"),
   get: () => ipcRenderer.invoke("auth:get"),
 };

@@ -132,10 +132,11 @@ export class GeminiSessionManager {
       deviceId: this.config.deviceId,
     });
     const wsUrl = `${base}/ws?${params}`;
+    const wsConnectStart = Date.now();
     this.ws = new WebSocket(wsUrl);
 
     this.ws.on("open", () => {
-      console.log("[SM] WS connected");
+      console.log(`[Latency] WS connected in ${Date.now() - wsConnectStart}ms`);
       this.send({ type: "auth", token: this.accessToken! });
     });
 
@@ -162,6 +163,7 @@ export class GeminiSessionManager {
 
   private handleServerMessage(msg: ServerMsg): void {
     if (msg.type === "auth_ok") {
+      console.log(`[Latency] auth_ok received, session setup ${Date.now() - this.sessionStartedAt!}ms from start`);
       this.send({
         type: "config",
         youTarget: this.config.language.youTarget,
@@ -174,6 +176,7 @@ export class GeminiSessionManager {
     if (msg.type === "config_ok") return;
 
     if (msg.type === "stt_connected") {
+      console.log(`[Latency] ${msg.speaker} STT ready, ${Date.now() - this.sessionStartedAt!}ms from start`);
       if (msg.speaker === "you") this.youState = "ready";
       else this.themState = "ready";
       this.emitSnapshot();
@@ -209,6 +212,10 @@ export class GeminiSessionManager {
     }
   }
 
+  // ── Utterance timing ──
+  private utteranceCreatedAt = new Map<string, number>();
+  private sentenceTimings = new Map<string, number>(); // "speaker:sentenceIdx" → timestamp
+
   // ── Partial: speech in progress ──
 
   private handlePartial(speaker: Speaker, text: string): void {
@@ -242,9 +249,12 @@ export class GeminiSessionManager {
       // Cancel pending finalization — more content coming
       s.pendingEnd = false;
       s.partial = "";
+      const sentIdx = s.sentences.length;
       s.sentences.push(text);
       s.translations.push(null);
       s.pendingTranslations++;
+      this.sentenceTimings.set(`${speaker}:${sentIdx}`, Date.now());
+      console.log(`[Latency] ${speaker} sentence[${sentIdx}] received, pending translation: "${text.slice(0, 60)}"`);
 
       const utteranceId = this.ensureUtterance(speaker);
       if (!utteranceId) return;
@@ -266,6 +276,12 @@ export class GeminiSessionManager {
         // Update existing utterance
         s.translations[idx] = translation;
         s.pendingTranslations = Math.max(0, s.pendingTranslations - 1);
+        const sentKey = `${speaker}:${idx}`;
+        const sentAt = this.sentenceTimings.get(sentKey);
+        if (sentAt) {
+          console.log(`[Latency] ${speaker} sentence[${idx}] translated in ${Date.now() - sentAt}ms: "${translation.slice(0, 60)}"`);
+          this.sentenceTimings.delete(sentKey);
+        }
 
         if (s.utteranceId) {
           this.queue.upsert(s.utteranceId, {
@@ -308,6 +324,11 @@ export class GeminiSessionManager {
 
     // All translations received + silence detected → finalize
     if (s.utteranceId) {
+      const createdAt = this.utteranceCreatedAt.get(s.utteranceId);
+      if (createdAt) {
+        console.log(`[Latency] ${speaker} utterance finalized in ${Date.now() - createdAt}ms (${s.sentences.length} sentences)`);
+        this.utteranceCreatedAt.delete(s.utteranceId);
+      }
       this.queue.upsert(s.utteranceId, { status: "done" as UtteranceStatus });
     }
 
@@ -334,6 +355,8 @@ export class GeminiSessionManager {
     });
 
     s.utteranceId = utterance.id;
+    this.utteranceCreatedAt.set(utterance.id, Date.now());
+    console.log(`[Latency] ${speaker} utterance created: ${utterance.id}`);
     return utterance.id;
   }
 
