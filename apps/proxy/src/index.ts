@@ -1,11 +1,9 @@
 import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { createRemoteJWKSet, jwtVerify } from "jose";
-import { GoogleGenAI } from "@google/genai";
 import { z } from "zod";
 import {
   SESSION_LIMITS,
-  GEMINI_MODELS,
   type TokenResponse,
   type TokenError,
 } from "@realtime/shared";
@@ -20,6 +18,7 @@ interface Env {
   SUPABASE_JWT_ISSUER?: string;
   GEMINI_API_KEY: string;
   DEEPGRAM_API_KEY: string;
+  GOOGLE_TRANSLATE_API_KEY: string;
 }
 
 // ── Durable Object: Usage Tracking ──
@@ -112,6 +111,8 @@ export class TranslationSession {
   private themTarget = "en-US";
   private authenticated = false;
   private sessionStartedAt: number | null = null;
+  private lastAudioSentAt: { you: number; them: number } = { you: 0, them: 0 };
+  private audioChunkCount: { you: number; them: number } = { you: 0, them: 0 };
 
   constructor(state: DurableObjectState, env: Env) {
     this.state = state;
@@ -218,8 +219,12 @@ export class TranslationSession {
       const buf = base64ToArrayBuffer(msg.data);
       if (msg.speaker === "you" && this.youDg?.readyState === WebSocket.OPEN) {
         this.youDg.send(buf);
+        this.lastAudioSentAt.you = Date.now();
+        this.audioChunkCount.you++;
       } else if (msg.speaker === "them" && this.themDg?.readyState === WebSocket.OPEN) {
         this.themDg.send(buf);
+        this.lastAudioSentAt.them = Date.now();
+        this.audioChunkCount.them++;
       }
       return;
     }
@@ -251,10 +256,11 @@ export class TranslationSession {
     const key = this.env.DEEPGRAM_API_KEY;
     const url = `wss://api.deepgram.com/v1/listen?model=nova-3&language=multi&encoding=linear16&sample_rate=16000&punctuate=true&interim_results=true&utterance_end_ms=3000&smart_format=true`;
 
+    const dgConnectStart = Date.now();
     const ws = new WebSocket(url, ["token", key]);
 
     ws.addEventListener("open", () => {
-      console.log(`[TranslationSession] Deepgram ${speaker} connected`);
+      console.log(`[Latency] Deepgram ${speaker} connected in ${Date.now() - dgConnectStart}ms`);
       this.sendToClient({ type: "stt_connected", speaker });
     });
 
@@ -275,6 +281,7 @@ export class TranslationSession {
   }
 
   private async handleDeepgramMessage(speaker: "you" | "them", event: MessageEvent): Promise<void> {
+    const dgRecvAt = Date.now();
     let msg: DeepgramMsg;
     try {
       const text = typeof event.data === "string" ? event.data : new TextDecoder().decode(event.data as ArrayBuffer);
@@ -283,12 +290,14 @@ export class TranslationSession {
 
     // v2 Flux: EndOfTurn / EagerEndOfTurn
     if (msg.type === "EndOfTurn" || msg.type === "EagerEndOfTurn") {
+      console.log(`[Latency] ${speaker} end_of_turn received`);
       this.sendToClient({ type: "end_of_turn", speaker });
       return;
     }
 
     // v1: UtteranceEnd (similar to EndOfTurn)
     if (msg.type === "UtteranceEnd") {
+      console.log(`[Latency] ${speaker} utterance_end received`);
       this.sendToClient({ type: "end_of_turn", speaker });
       return;
     }
@@ -299,6 +308,13 @@ export class TranslationSession {
 
     const transcript = alt.transcript.trim();
 
+    // Deepgram STT latency: time from last audio chunk to transcript received
+    const dgDuration = msg.duration ?? 0;
+    const dgStart = msg.start ?? 0;
+    const lastAudio = this.lastAudioSentAt[speaker];
+    const sttLatency = lastAudio > 0 ? dgRecvAt - lastAudio : -1;
+    console.log(`[Latency] ${speaker} STT ${msg.is_final ? "final" : "partial"}: stt_latency=${sttLatency}ms audio_offset=${dgStart.toFixed(1)}s duration=${dgDuration.toFixed(1)}s chunks_sent=${this.audioChunkCount[speaker]} text="${transcript.slice(0, 60)}"`);
+
     if (!msg.is_final) {
       this.sendToClient({ type: "partial", speaker, text: transcript });
       return;
@@ -308,32 +324,32 @@ export class TranslationSession {
     this.sendToClient({ type: "sentence", speaker, text: transcript, translation: null });
 
     const targetLang = speaker === "you" ? this.youTarget : this.themTarget;
+    const translateStart = Date.now();
     const translation = await this.translate(transcript, targetLang);
+    const translateMs = Date.now() - translateStart;
+
+    console.log(`[Latency] ${speaker} translation: ${translateMs}ms input=${transcript.length}chars output=${translation.length}chars text="${translation.slice(0, 60)}"`);
 
     this.sendToClient({ type: "sentence", speaker, text: transcript, translation });
   }
 
   private async translate(text: string, targetLang: string): Promise<string> {
     try {
-      const langKey = targetLang.split("-")[0] ?? targetLang;
-      const langName = LANG_NAMES[langKey] ?? targetLang;
-      const client = new GoogleGenAI({ apiKey: this.env.GEMINI_API_KEY });
-      const result = await client.models.generateContent({
-        model: "gemini-2.5-flash-lite",
-        contents: [{ role: "user", parts: [{ text:
-          `You are a real-time speech translator. Translate the following spoken text into ${langName}.
-
-Rules:
-- Output ONLY the translated text, nothing else — no labels, no quotes, no commentary
-- Translate the ENTIRE input from start to end — do not skip, truncate, or summarize any part
-- The input may be code-mixed (multiple languages in one sentence). Translate ALL of it into ${langName}
-- Keep proper nouns, brand names, and technical abbreviations (MCP, API, PR, etc.) as-is
-- Preserve tone, intent, and sentence structure naturally
-
-Text: ${text}` }] }],
-        config: { temperature: 0, maxOutputTokens: 512 },
-      });
-      return result.text?.trim() ?? "";
+      const target = targetLang.split("-")[0] ?? targetLang;
+      const res = await fetch(
+        `https://translation.googleapis.com/language/translate/v2?key=${this.env.GOOGLE_TRANSLATE_API_KEY}`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ q: text, target, format: "text" }),
+        },
+      );
+      if (!res.ok) {
+        console.error(`[TranslationSession] Google Translate error: ${res.status} ${await res.text()}`);
+        return "";
+      }
+      const json = (await res.json()) as { data?: { translations?: Array<{ translatedText?: string }> } };
+      return json.data?.translations?.[0]?.translatedText ?? "";
     } catch (err) {
       console.error("[TranslationSession] Translation error:", err);
       return "";
@@ -375,17 +391,10 @@ type ServerMsg =
 interface DeepgramMsg {
   type?: string;
   is_final?: boolean;
+  start?: number;
+  duration?: number;
   channel?: { alternatives?: Array<{ transcript?: string; confidence?: number }> };
 }
-
-const LANG_NAMES: Record<string, string> = {
-  en: "English", hi: "Hindi", es: "Spanish", fr: "French", de: "German",
-  pt: "Portuguese", it: "Italian", ja: "Japanese", ko: "Korean", zh: "Chinese",
-  ar: "Arabic", ru: "Russian", nl: "Dutch", sv: "Swedish", pl: "Polish",
-  tr: "Turkish", vi: "Vietnamese", th: "Thai", id: "Indonesian", ms: "Malay",
-  bn: "Bengali", ta: "Tamil", te: "Telugu", mr: "Marathi", gu: "Gujarati",
-  kn: "Kannada", ml: "Malayalam", pa: "Punjabi", ur: "Urdu", uk: "Ukrainian",
-};
 
 function base64ToArrayBuffer(b64: string): ArrayBuffer {
   const bin = atob(b64);
@@ -439,9 +448,8 @@ app.get("/ws", async (c) => {
     return new Response("Invalid token", { status: 401 });
   }
 
-  // Per-user-per-device DO instance
-  const doName = `${claims.sub}:${deviceId}`;
-  const id = c.env.TRANSLATION_SESSION.idFromName(doName);
+  // Per-device DO instance
+  const id = c.env.TRANSLATION_SESSION.idFromName(deviceId);
   const stub = c.env.TRANSLATION_SESSION.get(id);
   return stub.fetch(c.req.raw);
 });
@@ -489,25 +497,21 @@ app.post("/api/translate", async (c) => {
     return c.json({ code: "invalid_request", message: "Invalid request" } satisfies TokenError, 400);
 
   try {
-    const langKey = parsed.data.targetLang.split("-")[0] ?? parsed.data.targetLang;
-    const langName = LANG_NAMES[langKey] ?? parsed.data.targetLang;
-    const client = new GoogleGenAI({ apiKey: c.env.GEMINI_API_KEY });
-    const result = await client.models.generateContent({
-      model: "gemini-2.5-flash-lite",
-      contents: [{ role: "user", parts: [{ text:
-        `You are a real-time speech translator. Translate the following spoken text into ${langName}.
-
-Rules:
-- Output ONLY the translated text, nothing else — no labels, no quotes, no commentary
-- Translate the ENTIRE input from start to end — do not skip, truncate, or summarize any part
-- The input may be code-mixed (multiple languages in one sentence). Translate ALL of it into ${langName}
-- Keep proper nouns, brand names, and technical abbreviations (MCP, API, PR, etc.) as-is
-- Preserve tone, intent, and sentence structure naturally
-
-Text: ${parsed.data.text}` }] }],
-      config: { temperature: 0, maxOutputTokens: 512 },
-    });
-    return c.json({ text: result.text?.trim() ?? "" });
+    const target = parsed.data.targetLang.split("-")[0] ?? parsed.data.targetLang;
+    const res = await fetch(
+      `https://translation.googleapis.com/language/translate/v2?key=${c.env.GOOGLE_TRANSLATE_API_KEY}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ q: parsed.data.text, target, format: "text" }),
+      },
+    );
+    if (!res.ok) {
+      const errText = await res.text();
+      return c.json({ code: "token_generation_failed", message: errText } satisfies TokenError, 500);
+    }
+    const json = (await res.json()) as { data?: { translations?: Array<{ translatedText?: string }> } };
+    return c.json({ text: json.data?.translations?.[0]?.translatedText ?? "" });
   } catch (err) {
     return c.json({ code: "token_generation_failed", message: err instanceof Error ? err.message : "Failed" } satisfies TokenError, 500);
   }

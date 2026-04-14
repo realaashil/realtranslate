@@ -116,17 +116,19 @@ const pipelineBtn = el("button", { id: "pipeline-btn", type: "button" }, "Start"
 const clearBtn = el("button", { id: "clear-btn", type: "button" }, "Clear");
 const viewModeBtn = el("button", { id: "view-mode-btn", type: "button" }, "Subtitle");
 const headerSignOutBtn = el("button", { id: "header-signout", type: "button", style: "display:none" }, "Sign Out");
+const exitBtn = el("button", { id: "exit-btn", type: "button" }, "Exit");
 
 const header = el("header", { class: "overlay-header" },
   el("div", { class: "header-left" }, brandSpan, langBadge),
   el("div", { class: "header-right" },
     dailyMeta,
-    el("div", { class: "header-actions" }, toggleBtn, viewModeBtn, settingsBtn, pipelineBtn, clearBtn, headerSignOutBtn),
+    el("div", { class: "header-actions" }, toggleBtn, viewModeBtn, settingsBtn, pipelineBtn, clearBtn, headerSignOutBtn, exitBtn),
   ),
 );
 
 // Auth panel — login / sign-up dual view
-let authMode: "login" | "signup" = "login";
+let authMode: "login" | "signup" | "otp" = "login";
+let pendingOtpEmail = "";
 
 const authStateChip = el("span", { id: "auth-state" });
 const authUserSpan = el("span", {}, "Not signed in");
@@ -182,10 +184,26 @@ const signupForm = el("form", { id: "signup-form", class: "auth-form" },
   el("p", { class: "auth-footer-text" }, "Already have an account? ", signupToggleLink),
 );
 
+// OTP verification form
+const otpInput = el("input", { id: "otp-code", type: "text", placeholder: "6-digit code", required: "", maxlength: "6" });
+const otpSubmitBtn = el("button", { type: "submit", class: "btn-primary" }, "Verify");
+const otpErrorP = el("p", { class: "auth-error", id: "otp-error" });
+const otpBackLink = el("a", { href: "#", class: "auth-toggle-link" }, "Back to Sign Up");
+const otpForm = el("form", { id: "otp-form", class: "auth-form" },
+  el("div", { class: "auth-field" },
+    el("label", { for: "otp-code" }, "Verification Code"),
+    otpInput,
+  ),
+  el("div", { class: "auth-actions" }, otpSubmitBtn),
+  otpErrorP,
+  el("p", { class: "auth-footer-text" }, "Didn't get the code? ", otpBackLink),
+);
+
 // Auth header + container
 const authHeaderTitle = el("p", {}, "Welcome Back");
 const loginContainer = el("div", { id: "login-container" }, loginForm);
 const signupContainer = el("div", { id: "signup-container", style: "display:none" }, signupForm);
+const otpContainer = el("div", { id: "otp-container", style: "display:none" }, otpForm);
 
 const authPanel = el("section", { class: "auth-panel", id: "auth-panel", style: "display:none" },
   el("div", { class: "auth-header" },
@@ -194,21 +212,20 @@ const authPanel = el("section", { class: "auth-panel", id: "auth-panel", style: 
   ),
   loginContainer,
   signupContainer,
+  otpContainer,
 );
 
-const showAuthMode = (mode: "login" | "signup"): void => {
+const showAuthMode = (mode: "login" | "signup" | "otp"): void => {
   authMode = mode;
   authErrorP.textContent = "";
   signupErrorP.textContent = "";
-  if (mode === "login") {
-    loginContainer.style.display = "";
-    signupContainer.style.display = "none";
-    authHeaderTitle.textContent = "Welcome Back";
-  } else {
-    loginContainer.style.display = "none";
-    signupContainer.style.display = "";
-    authHeaderTitle.textContent = "Create Account";
-  }
+  otpErrorP.textContent = "";
+  loginContainer.style.display = mode === "login" ? "" : "none";
+  signupContainer.style.display = mode === "signup" ? "" : "none";
+  otpContainer.style.display = mode === "otp" ? "" : "none";
+  if (mode === "login") authHeaderTitle.textContent = "Welcome Back";
+  else if (mode === "signup") authHeaderTitle.textContent = "Create Account";
+  else authHeaderTitle.textContent = "Check your email";
 };
 
 // Status bar
@@ -793,8 +810,14 @@ signupForm.addEventListener("submit", async (e) => {
   }
 
   try {
-    await window.auth.signUp({ email, password });
-    renderSnapshot(await window.pipelines.get());
+    const snap = await window.auth.signUp({ email, password });
+    if (snap.status === "signed_in") {
+      renderSnapshot(await window.pipelines.get());
+    } else {
+      // Needs OTP verification
+      pendingOtpEmail = email;
+      showAuthMode("otp");
+    }
   } catch (err) {
     signupErrorP.textContent = err instanceof Error ? err.message : "Couldn't create account, please try again";
   }
@@ -808,6 +831,27 @@ loginToggleLink.addEventListener("click", (e) => {
 signupToggleLink.addEventListener("click", (e) => {
   e.preventDefault();
   showAuthMode("login");
+});
+
+otpForm.addEventListener("submit", async (e) => {
+  e.preventDefault();
+  otpErrorP.textContent = "";
+  const code = otpInput.value.trim();
+  if (!code) {
+    otpErrorP.textContent = "Please enter the verification code";
+    return;
+  }
+  try {
+    await window.auth.verifyOtp(pendingOtpEmail, code);
+    renderSnapshot(await window.pipelines.get());
+  } catch (err) {
+    otpErrorP.textContent = err instanceof Error ? err.message : "Invalid code, please try again";
+  }
+});
+
+otpBackLink.addEventListener("click", (e) => {
+  e.preventDefault();
+  showAuthMode("signup");
 });
 
 authSignOutBtn.addEventListener("click", async () => {
@@ -847,6 +891,10 @@ headerSignOutBtn.addEventListener("click", async () => {
   } catch (err) {
     footerNotice.textContent = err instanceof Error ? err.message : "Couldn't sign out";
   }
+});
+
+exitBtn.addEventListener("click", () => {
+  window.overlay.quit();
 });
 
 // ── System Audio IPC (macOS/Windows) ──
