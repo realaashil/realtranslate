@@ -166,7 +166,9 @@ export class GeminiSessionManager {
       console.log(`[Latency] auth_ok received, session setup ${Date.now() - this.sessionStartedAt!}ms from start`);
       this.send({
         type: "config",
+        youSource: this.config.language.youSource,
         youTarget: this.config.language.youTarget,
+        themSource: this.config.language.themSource,
         themTarget: this.config.language.themTarget,
       });
       this.send({ type: "start" });

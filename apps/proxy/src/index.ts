@@ -107,12 +107,23 @@ export class TranslationSession {
   private client: WebSocket | null = null;
   private youDg: WebSocket | null = null;
   private themDg: WebSocket | null = null;
+  private youSource = "auto";
   private youTarget = "hi-IN";
+  private themSource = "auto";
   private themTarget = "en-US";
   private authenticated = false;
   private sessionStartedAt: number | null = null;
   private lastAudioSentAt: { you: number; them: number } = { you: 0, them: 0 };
   private audioChunkCount: { you: number; them: number } = { you: 0, them: 0 };
+
+  // Sentence buffering: accumulate Deepgram finals until a full sentence is detected
+  private sentenceBuffers: Record<"you" | "them", { fragments: string[]; flushTimer: ReturnType<typeof setTimeout> | null }> = {
+    you: { fragments: [], flushTimer: null },
+    them: { fragments: [], flushTimer: null },
+  };
+  private static readonly SENTENCE_ENDERS = /[.!?;。！？；]\s*$/;
+  private static readonly MAX_BUFFER_WORDS = 12;
+  private static readonly FLUSH_TIMEOUT_MS = 2000;
 
   constructor(state: DurableObjectState, env: Env) {
     this.state = state;
@@ -203,7 +214,9 @@ export class TranslationSession {
     }
 
     if (msg.type === "config") {
+      if (msg.youSource) this.youSource = msg.youSource;
       if (msg.youTarget) this.youTarget = msg.youTarget;
+      if (msg.themSource) this.themSource = msg.themSource;
       if (msg.themTarget) this.themTarget = msg.themTarget;
       this.sendToClient({ type: "config_ok" });
       return;
@@ -288,16 +301,17 @@ export class TranslationSession {
       msg = JSON.parse(text) as DeepgramMsg;
     } catch { return; }
 
-    // v2 Flux: EndOfTurn / EagerEndOfTurn
+    // EndOfTurn / UtteranceEnd — flush sentence buffer first, then signal end
     if (msg.type === "EndOfTurn" || msg.type === "EagerEndOfTurn") {
       console.log(`[Latency] ${speaker} end_of_turn received`);
+      await this.flushSentenceBuffer(speaker);
       this.sendToClient({ type: "end_of_turn", speaker });
       return;
     }
 
-    // v1: UtteranceEnd (similar to EndOfTurn)
     if (msg.type === "UtteranceEnd") {
       console.log(`[Latency] ${speaker} utterance_end received`);
+      await this.flushSentenceBuffer(speaker);
       this.sendToClient({ type: "end_of_turn", speaker });
       return;
     }
@@ -308,7 +322,7 @@ export class TranslationSession {
 
     const transcript = alt.transcript.trim();
 
-    // Deepgram STT latency: time from last audio chunk to transcript received
+    // Deepgram STT latency
     const dgDuration = msg.duration ?? 0;
     const dgStart = msg.start ?? 0;
     const lastAudio = this.lastAudioSentAt[speaker];
@@ -320,28 +334,83 @@ export class TranslationSession {
       return;
     }
 
-    // Final sentence — send immediately, then translate
-    this.sendToClient({ type: "sentence", speaker, text: transcript, translation: null });
-
-    const targetLang = speaker === "you" ? this.youTarget : this.themTarget;
-    const translateStart = Date.now();
-    const translation = await this.translate(transcript, targetLang);
-    const translateMs = Date.now() - translateStart;
-
-    console.log(`[Latency] ${speaker} translation: ${translateMs}ms input=${transcript.length}chars output=${translation.length}chars text="${translation.slice(0, 60)}"`);
-
-    this.sendToClient({ type: "sentence", speaker, text: transcript, translation });
+    // Final transcript — buffer until a full sentence is detected
+    this.bufferSentence(speaker, transcript);
   }
 
-  private async translate(text: string, targetLang: string): Promise<string> {
+  /** Add a final transcript fragment to the sentence buffer. Flushes when a full sentence is detected. */
+  private bufferSentence(speaker: "you" | "them", text: string): void {
+    const buf = this.sentenceBuffers[speaker];
+
+    // Clear any pending timeout flush
+    if (buf.flushTimer !== null) {
+      clearTimeout(buf.flushTimer);
+      buf.flushTimer = null;
+    }
+
+    buf.fragments.push(text);
+    const combined = buf.fragments.join(" ");
+
+    // Flush immediately if sentence-ending punctuation or buffer is long enough
+    const endsWithPunctuation = TranslationSession.SENTENCE_ENDERS.test(combined);
+    const wordCount = combined.split(/\s+/).length;
+
+    if (endsWithPunctuation || wordCount >= TranslationSession.MAX_BUFFER_WORDS) {
+      console.log(`[SentenceBuffer] ${speaker} flushing ${buf.fragments.length} fragments (${wordCount} words, punctuation=${endsWithPunctuation}): "${combined.slice(0, 80)}"`);
+      void this.flushSentenceBuffer(speaker);
+      return;
+    }
+
+    // No sentence boundary yet — schedule a timeout flush
+    console.log(`[SentenceBuffer] ${speaker} buffering (${buf.fragments.length} fragments, ${wordCount} words): "${combined.slice(0, 80)}"`);
+    buf.flushTimer = setTimeout(() => {
+      buf.flushTimer = null;
+      console.log(`[SentenceBuffer] ${speaker} timeout flush`);
+      void this.flushSentenceBuffer(speaker);
+    }, TranslationSession.FLUSH_TIMEOUT_MS);
+  }
+
+  /** Flush the sentence buffer: combine fragments, translate, and send to client. */
+  private async flushSentenceBuffer(speaker: "you" | "them"): Promise<void> {
+    const buf = this.sentenceBuffers[speaker];
+
+    if (buf.flushTimer !== null) {
+      clearTimeout(buf.flushTimer);
+      buf.flushTimer = null;
+    }
+
+    if (buf.fragments.length === 0) return;
+
+    const combined = buf.fragments.join(" ");
+    buf.fragments = [];
+
+    // Send the combined sentence immediately (translation pending)
+    this.sendToClient({ type: "sentence", speaker, text: combined, translation: null });
+
+    // Translate and send the result
+    const sourceLang = speaker === "you" ? this.youSource : this.themSource;
+    const targetLang = speaker === "you" ? this.youTarget : this.themTarget;
+    const translateStart = Date.now();
+    const translation = await this.translate(combined, sourceLang, targetLang);
+    const translateMs = Date.now() - translateStart;
+
+    console.log(`[Latency] ${speaker} translation: ${translateMs}ms input=${combined.length}chars output=${translation.length}chars text="${translation.slice(0, 60)}"`);
+
+    this.sendToClient({ type: "sentence", speaker, text: combined, translation });
+  }
+
+  private async translate(text: string, sourceLang: string, targetLang: string): Promise<string> {
     try {
+      const source = sourceLang.split("-")[0] ?? sourceLang;
       const target = targetLang.split("-")[0] ?? targetLang;
+      const body: Record<string, string> = { q: text, target, format: "text" };
+      if (source && source !== "auto") body.source = source;
       const res = await fetch(
         `https://translation.googleapis.com/language/translate/v2?key=${this.env.GOOGLE_TRANSLATE_API_KEY}`,
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ q: text, target, format: "text" }),
+          body: JSON.stringify(body),
         },
       );
       if (!res.ok) {
@@ -363,6 +432,15 @@ export class TranslationSession {
   }
 
   private cleanup(): void {
+    // Clear sentence buffer timers
+    for (const speaker of ["you", "them"] as const) {
+      const buf = this.sentenceBuffers[speaker];
+      if (buf.flushTimer !== null) {
+        clearTimeout(buf.flushTimer);
+        buf.flushTimer = null;
+      }
+      buf.fragments = [];
+    }
     if (this.youDg) { try { this.youDg.close(); } catch { /* */ } this.youDg = null; }
     if (this.themDg) { try { this.themDg.close(); } catch { /* */ } this.themDg = null; }
     this.authenticated = false;
@@ -371,7 +449,7 @@ export class TranslationSession {
 
 type ClientMsg =
   | { type: "auth"; token: string; deviceId?: string }
-  | { type: "config"; youTarget?: string; themTarget?: string }
+  | { type: "config"; youSource?: string; youTarget?: string; themSource?: string; themTarget?: string }
   | { type: "start" }
   | { type: "audio"; speaker: "you" | "them"; data: string }
   | { type: "mute"; speaker: "you" | "them" }
@@ -481,7 +559,7 @@ app.post("/api/token", async (c) => {
 });
 
 // Simple translate endpoint
-const translateSchema = z.object({ text: z.string().min(1), targetLang: z.string().min(2) });
+const translateSchema = z.object({ text: z.string().min(1), sourceLang: z.string().min(2).optional(), targetLang: z.string().min(2) });
 
 app.post("/api/translate", async (c) => {
   const authHeader = c.req.header("Authorization");
@@ -497,13 +575,16 @@ app.post("/api/translate", async (c) => {
     return c.json({ code: "invalid_request", message: "Invalid request" } satisfies TokenError, 400);
 
   try {
+    const source = parsed.data.sourceLang?.split("-")[0];
     const target = parsed.data.targetLang.split("-")[0] ?? parsed.data.targetLang;
+    const translateBody: Record<string, string> = { q: parsed.data.text, target, format: "text" };
+    if (source && source !== "auto") translateBody.source = source;
     const res = await fetch(
       `https://translation.googleapis.com/language/translate/v2?key=${c.env.GOOGLE_TRANSLATE_API_KEY}`,
       {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ q: parsed.data.text, target, format: "text" }),
+        body: JSON.stringify(translateBody),
       },
     );
     if (!res.ok) {

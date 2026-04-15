@@ -3,8 +3,10 @@ import {
   BrowserWindow,
   Menu,
   Tray,
+  desktopCapturer,
   globalShortcut,
   ipcMain,
+  session,
 } from "electron";
 import { createClient, type Session, type User } from "@supabase/supabase-js";
 import Store from "electron-store";
@@ -28,7 +30,6 @@ import {
 } from "./gemini-session-manager";
 import {
   startSystemAudioCapture,
-  getDesktopSourceId,
   type SystemAudioCapture,
 } from "./audio-capture";
 
@@ -146,7 +147,7 @@ const readSettings = (): AppSettings => {
   return {
     // If TOKEN_SERVICE_URL was set at build time, always use it (overrides persisted value)
     tokenServiceUrl: process.env.TOKEN_SERVICE_URL || store.get("tokenServiceUrl", DEFAULT_TOKEN_SERVICE_URL) || DEFAULT_TOKEN_SERVICE_URL,
-    language: store.get("language", DEFAULT_LANGUAGE_SETTINGS),
+    language: { ...DEFAULT_LANGUAGE_SETTINGS, ...store.get("language", DEFAULT_LANGUAGE_SETTINGS) },
     overlayBounds: store.get("overlayBounds", DEFAULT_OVERLAY_BOUNDS),
   };
 };
@@ -335,10 +336,9 @@ const startPipelines = async (): Promise<PipelineSnapshot> => {
         console.log("[Main] System audio capture started (parec)");
       }
     } else {
-      // macOS/Windows: renderer-based capture via desktopCapturer
-      const sourceId = await getDesktopSourceId();
-      if (sourceId && overlayWindow && !overlayWindow.isDestroyed()) {
-        overlayWindow.webContents.send("system-audio:start", sourceId);
+      // macOS/Windows: renderer-based capture via getDisplayMedia + loopback
+      if (overlayWindow && !overlayWindow.isDestroyed()) {
+        overlayWindow.webContents.send("system-audio:start", "loopback");
         // Track as a capture so stopPipelines can clean up
         systemAudioCapture = {
           stop: () => {
@@ -647,9 +647,9 @@ const updateTokenServiceUrl = (url: string): AppSettings => {
 
 const updateLanguage = (language: LanguageSettings): AppSettings => {
   const normalized: LanguageSettings = {
-    youSource: "auto",
+    youSource: language.youSource?.trim() || "auto",
     youTarget: language.youTarget.trim(),
-    themSource: "auto",
+    themSource: language.themSource?.trim() || "auto",
     themTarget: language.themTarget.trim(),
   };
 
@@ -782,6 +782,16 @@ const meetingOrchestrator = new MeetingOrchestrator({
 
 app.on("ready", async () => {
   if (process.platform === "darwin") app.dock?.hide();
+
+  // Set up display media handler for system audio capture (macOS/Windows)
+  // This allows the renderer to call getDisplayMedia() and receive system audio via loopback
+  if (process.platform !== "linux") {
+    session.defaultSession.setDisplayMediaRequestHandler((_request, callback) => {
+      desktopCapturer.getSources({ types: ["screen"], thumbnailSize: { width: 0, height: 0 } }).then((sources) => {
+        callback({ video: sources[0], audio: "loopback" });
+      });
+    });
+  }
 
   appSettings = readSettings();
   sessionManager.updateConfig({

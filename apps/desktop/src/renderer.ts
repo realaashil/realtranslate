@@ -61,8 +61,15 @@ const LANGUAGES: { code: string; flag: string; name: string }[] = [
   { code: "uk-UA", flag: "\u{1F1FA}\u{1F1E6}", name: "Ukrainian" },
 ];
 
-const makeLangSelect = (id: string, selected: string): HTMLSelectElement => {
+const makeLangSelect = (id: string, selected: string, includeAuto = false): HTMLSelectElement => {
   const sel = el("select", { id, class: "lang-select" }) as unknown as HTMLSelectElement;
+  if (includeAuto) {
+    const opt = document.createElement("option");
+    opt.value = "auto";
+    opt.textContent = "\u26A0\uFE0F  Auto (lower quality)";
+    if (selected === "auto") opt.selected = true;
+    sel.append(opt);
+  }
   for (const lang of LANGUAGES) {
     const opt = document.createElement("option");
     opt.value = lang.code;
@@ -277,15 +284,61 @@ const bottomNav = el("nav", { class: "bottom-nav" }, navListening, navProcessing
 
 // Settings panel
 const tokenServiceInput = el("input", { id: "token-service-url", type: "text", placeholder: "http://127.0.0.1:8787" });
+const youSourceSelect = makeLangSelect("you-source", "auto", true);
 const youTargetSelect = makeLangSelect("you-target", "hi-IN");
+const themSourceSelect = makeLangSelect("them-source", "auto", true);
 const themTargetSelect = makeLangSelect("them-target", "en-US");
+const micSourceSelect = el("select", { id: "mic-source", class: "lang-select" }) as unknown as HTMLSelectElement;
 const saveSettingsBtn = el("button", { id: "save-settings", type: "button", class: "btn-secondary" }, "Save");
 const settingsStatusP = el("p", { class: "settings-status", id: "settings-status" });
 
+const populateMicDevices = async (): Promise<void> => {
+  try {
+    // Ensure permission is granted so labels are available
+    const tempStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    tempStream.getTracks().forEach((t) => t.stop());
+
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    const audioInputs = devices.filter((d) => d.kind === "audioinput");
+    const prev = micSourceSelect.value;
+
+    const defaultOpt = document.createElement("option");
+    defaultOpt.value = "default";
+    defaultOpt.textContent = "Default";
+
+    const opts = [defaultOpt];
+    for (const dev of audioInputs) {
+      if (dev.deviceId === "default") continue;
+      const opt = document.createElement("option");
+      opt.value = dev.deviceId;
+      opt.textContent = dev.label || `Microphone ${dev.deviceId.slice(0, 8)}`;
+      opts.push(opt);
+    }
+    micSourceSelect.replaceChildren(...opts);
+
+    // Restore previous selection if still available
+    if (prev && Array.from(micSourceSelect.options).some((o) => o.value === prev)) {
+      micSourceSelect.value = prev;
+    }
+  } catch {
+    const opt = document.createElement("option");
+    opt.value = "default";
+    opt.textContent = "Default (no permission)";
+    micSourceSelect.replaceChildren(opt);
+  }
+};
+
 const settingsPanel = el("section", { class: "settings-panel", id: "settings-panel" },
   el("div", { class: "settings-row" },
+    el("div", { class: "field" }, el("label", {}, "Microphone"), micSourceSelect as unknown as HTMLElement),
+  ),
+  el("div", { class: "settings-row" },
+    el("div", { class: "field" }, el("label", {}, "I speak"), youSourceSelect as unknown as HTMLElement),
     el("div", { class: "field" }, el("label", {}, "Translate me into"), youTargetSelect as unknown as HTMLElement),
-    el("div", { class: "field" }, el("label", {}, "Translate speaker into"), themTargetSelect as unknown as HTMLElement),
+  ),
+  el("div", { class: "settings-row" },
+    el("div", { class: "field" }, el("label", {}, "They speak"), themSourceSelect as unknown as HTMLElement),
+    el("div", { class: "field" }, el("label", {}, "Translate them into"), themTargetSelect as unknown as HTMLElement),
   ),
   el("div", { class: "settings-footer" }, saveSettingsBtn, settingsStatusP),
 );
@@ -326,8 +379,9 @@ const stopMicCapture = (): void => {
 
 const startMicCapture = async (): Promise<void> => {
   try {
+    const deviceId = micSourceSelect.value !== "default" ? micSourceSelect.value : undefined;
     const stream = await navigator.mediaDevices.getUserMedia({
-      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, ...(deviceId ? { deviceId: { exact: deviceId } } : {}) },
     });
     const ctx = new AudioContext({ sampleRate: 48000 });
     await ctx.audioWorklet.addModule("pcm-worklet.js");
@@ -501,31 +555,22 @@ const stopSystemAudioCapture = (): void => {
   if (systemStream) { systemStream.getTracks().forEach((t) => t.stop()); systemStream = null; }
 };
 
-const startSystemAudioCapture = async (sourceId: string): Promise<void> => {
+const startSystemAudioCapture = async (_sourceId: string): Promise<void> => {
   stopSystemAudioCapture();
   try {
-    // desktopCapturer requires both audio and video constraints
-    const stream = await navigator.mediaDevices.getUserMedia({
-      audio: {
-        mandatory: {
-          chromeMediaSource: "desktop",
-          chromeMediaSourceId: sourceId,
-        },
-      } as unknown as MediaTrackConstraints,
-      video: {
-        mandatory: {
-          chromeMediaSource: "desktop",
-          chromeMediaSourceId: sourceId,
-        },
-      } as unknown as MediaTrackConstraints,
-    });
+    // Use getDisplayMedia — the main process setDisplayMediaRequestHandler
+    // handles source selection and grants loopback audio automatically
+    const stream = await navigator.mediaDevices.getDisplayMedia({
+      audio: true,
+      video: true, // required by the API, we discard immediately
+    } as DisplayMediaStreamOptions);
 
     // Stop video tracks immediately — we only need audio
     stream.getVideoTracks().forEach((t) => t.stop());
 
     const audioTracks = stream.getAudioTracks();
     if (audioTracks.length === 0) {
-      console.warn("[SystemAudio] No audio tracks from desktopCapturer");
+      console.warn("[SystemAudio] No audio tracks from getDisplayMedia");
       return;
     }
 
@@ -664,7 +709,9 @@ const renderAuth = (auth: AuthSnapshot): void => {
 
 const renderSettings = (settings: AppSettings): void => {
   tokenServiceInput.value = settings.tokenServiceUrl;
+  youSourceSelect.value = settings.language.youSource;
   youTargetSelect.value = settings.language.youTarget;
+  themSourceSelect.value = settings.language.themSource;
   themTargetSelect.value = settings.language.themTarget;
 };
 
@@ -762,6 +809,7 @@ settingsBtn.addEventListener("click", () => {
   settingsVisible = !settingsVisible;
   settingsPanel.className = settingsVisible ? "settings-panel visible" : "settings-panel";
   settingsBtn.className = settingsVisible ? "active" : "";
+  if (settingsVisible) void populateMicDevices();
 });
 
 pipelineBtn.addEventListener("click", async () => {
@@ -866,15 +914,13 @@ authSignOutBtn.addEventListener("click", async () => {
 
 saveSettingsBtn.addEventListener("click", async () => {
   try {
-    const [next] = await Promise.all([
-      window.settings.updateTokenServiceUrl(tokenServiceInput.value.trim()),
-      window.settings.updateLanguage({
-        youSource: "auto",
-        youTarget: youTargetSelect.value,
-        themSource: "auto",
-        themTarget: themTargetSelect.value,
-      }),
-    ]);
+    await window.settings.updateTokenServiceUrl(tokenServiceInput.value.trim());
+    const next = await window.settings.updateLanguage({
+      youSource: youSourceSelect.value,
+      youTarget: youTargetSelect.value,
+      themSource: themSourceSelect.value,
+      themTarget: themTargetSelect.value,
+    });
     renderSettings(next);
     settingsStatusP.textContent = "Settings saved";
     renderSnapshot(await window.pipelines.get());
